@@ -1,6 +1,8 @@
 //! riscv64 adapter for the QEMU `virt` machine.
 
 pub mod entry;
+pub mod intr;
+pub mod kernelvec;
 pub mod start;
 pub mod vm;
 
@@ -38,4 +40,99 @@ pub fn intr_get() -> bool {
     // SAFETY: reading a CSR into a local; no memory is touched.
     unsafe { asm!("csrr {sstatus}, sstatus", sstatus = out(reg) sstatus, options(nomem, nostack)) };
     sstatus & SSTATUS_SIE != 0
+}
+
+// ---- CSR access for the trap layer (`riscv.h` inline functions). Each
+// helper is one instruction; none touch memory. ----
+
+/// Read `sstatus` (`r_sstatus`, riscv.h:51-58).
+pub fn r_sstatus() -> usize {
+    let v;
+    // SAFETY: reading a CSR into a local; no memory is touched.
+    unsafe { asm!("csrr {v}, sstatus", v = out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+/// Write `sstatus` (`w_sstatus`, riscv.h:59-64).
+pub fn w_sstatus(v: usize) {
+    // SAFETY: writing a CSR; no memory is touched.
+    unsafe { asm!("csrw sstatus, {v}", v = in(reg) v, options(nomem, nostack)) };
+}
+
+/// Read `sepc`, the exception program counter (`r_sepc`, riscv.h:141-146).
+pub fn r_sepc() -> usize {
+    let v;
+    // SAFETY: reading a CSR into a local; no memory is touched.
+    unsafe { asm!("csrr {v}, sepc", v = out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+/// Write `sepc` (`w_sepc`, riscv.h:135-139).
+pub fn w_sepc(v: usize) {
+    // SAFETY: writing a CSR; no memory is touched.
+    unsafe { asm!("csrw sepc, {v}", v = in(reg) v, options(nomem, nostack)) };
+}
+
+/// Read `scause`, the trap cause (`r_scause`, riscv.h:268-274).
+pub fn r_scause() -> usize {
+    let v;
+    // SAFETY: reading a CSR into a local; no memory is touched.
+    unsafe { asm!("csrr {v}, scause", v = out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+/// Read `stval`, the trap value (fault address) (`r_stval`, riscv.h:277-283).
+pub fn r_stval() -> usize {
+    let v;
+    // SAFETY: reading a CSR into a local; no memory is touched.
+    unsafe { asm!("csrr {v}, stval", v = out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+/// Write `stvec`, the trap vector (`w_stvec`, riscv.h:181-186).
+pub fn w_stvec(v: usize) {
+    // SAFETY: writing a CSR; no memory is touched.
+    unsafe { asm!("csrw stvec, {v}", v = in(reg) v, options(nomem, nostack)) };
+}
+
+/// Read `time`, the wall-clock cycle counter, readable in supervisor
+/// mode once `mcounteren.TM` is set (`r_time`, riscv.h:300-306;
+/// start.c:61-62).
+pub fn r_time() -> usize {
+    let v;
+    // SAFETY: reading a CSR into a local; no memory is touched.
+    unsafe { asm!("csrr {v}, time", v = out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+/// sstc timer compare register, by number: the named `stimecmp` operand
+/// is commented out in the reference in favor of `0x14d`
+/// (riscv.h:196-211).
+const STIMECMP: usize = 0x14d;
+
+/// Write `stimecmp`, arming the next supervisor timer interrupt
+/// (`w_stimecmp`, riscv.h:203-210).
+pub fn w_stimecmp(v: usize) {
+    // SAFETY: writing a CSR; no memory is touched.
+    unsafe {
+        asm!(
+            "csrw {csr}, {v}",
+            csr = const STIMECMP,
+            v = in(reg) v,
+            options(nomem, nostack)
+        )
+    };
+}
+
+/// Timer interval: 1_000_000 cycles is about a tenth of a second at the
+/// `virt` machine's 10 MHz `time` frequency (`start.c:65`, `trap.c:179`).
+pub const TIMER_INTERVAL: usize = 1_000_000;
+
+/// Park the hart until an interrupt is pending (`wfi`). With `sstatus.SIE`
+/// set the pending interrupt is taken through `stvec` on wake; the M3
+/// boot park, replaced by the scheduler loop in M4.
+pub fn wait_for_interrupt() {
+    // SAFETY: `wfi` is a hint that sleeps the hart; no memory effect and
+    // it cannot fault.
+    unsafe { asm!("wfi", options(nomem, nostack)) };
 }

@@ -3,6 +3,7 @@
 
 use core::arch::asm;
 
+use super::{r_time, w_stimecmp, TIMER_INTERVAL};
 use crate::main;
 
 // mstatus.MPP: previous privilege mode for mret (riscv.h:14-17).
@@ -15,6 +16,10 @@ const SIE_STIE: usize = 1 << 5; // supervisor timer
 
 // menvcfg (riscv.h:213-214).
 const MENVCFG_ADUE: usize = 1 << 61; // hardware A/D bit updates
+const MENVCFG_STCE: usize = 1 << 63; // sstc extension (stimecmp)
+
+// mcounteren.TM, bit 1: supervisor may read `time` (start.c:62).
+const MCOUNTEREN_TM: usize = 1 << 1;
 
 /// Read `mstatus`.
 fn r_mstatus() -> usize {
@@ -94,12 +99,41 @@ fn w_menvcfg(v: usize) {
     unsafe { asm!("csrw menvcfg, {v}", v = in(reg) v, options(nomem, nostack)) };
 }
 
+/// Read `mcounteren`.
+fn r_mcounteren() -> usize {
+    let v;
+    // SAFETY: reading a machine CSR has no effect on memory or stack.
+    unsafe { asm!("csrr {v}, mcounteren", v = out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+/// Write `mcounteren`.
+fn w_mcounteren(v: usize) {
+    // SAFETY: writing a machine CSR has no effect on memory or stack.
+    unsafe { asm!("csrw mcounteren, {v}", v = in(reg) v, options(nomem, nostack)) };
+}
+
 /// Read `mhartid`, this hart's id.
 fn r_mhartid() -> usize {
     let v;
     // SAFETY: reading a machine CSR has no effect on memory or stack.
     unsafe { asm!("csrr {v}, mhartid", v = out(reg) v, options(nomem, nostack)) };
     v
+}
+
+/// Ask each hart to generate timer interrupts (`timerinit`,
+/// start.c:54-66): enable the sstc extension, let supervisor mode at
+/// `time`/`stimecmp`, and arm the very first interrupt. Later rearms
+/// happen in supervisor mode, at the tail of `clockintr` (trap.c:179).
+fn timerinit() {
+    // enable the sstc extension (i.e. stimecmp) (start.c:58-59).
+    w_menvcfg(r_menvcfg() | MENVCFG_STCE);
+
+    // allow supervisor to use stimecmp and time (start.c:61-62).
+    w_mcounteren(r_mcounteren() | MCOUNTEREN_TM);
+
+    // ask for the very first timer interrupt (start.c:64-65).
+    w_stimecmp(r_time() + TIMER_INTERVAL);
 }
 
 /// Write `tp`, which the kernel reserves for this hart's id (`cpuid`).
@@ -110,12 +144,8 @@ fn w_tp(v: usize) {
     unsafe { asm!("mv tp, {v}", v = in(reg) v, options(nomem, nostack)) };
 }
 
-/// Machine-mode bring-up, then `mret` into supervisor-mode `main`.
-///
-/// Mirrors `start()` (`start.c:14-52`) minus `timerinit()` (`start.c:44`,
-/// `start.c:55-66`): the sstc timer (menvcfg.STCE, mcounteren, stimecmp)
-/// belongs to the trap/timer milestone, which also re-enables sie.STIE
-/// then.
+/// Machine-mode bring-up, then `mret` into supervisor-mode `main`
+/// (`start`, start.c:14-52).
 pub extern "C" fn start() -> ! {
     // set M Previous Privilege mode to Supervisor, for mret (start.c:17-21).
     w_mstatus((r_mstatus() & !MSTATUS_MPP_MASK) | MSTATUS_MPP_S);
@@ -140,6 +170,9 @@ pub extern "C" fn start() -> ! {
 
     // enable hardware updates of page table A and D bits (start.c:40-41).
     w_menvcfg(r_menvcfg() | MENVCFG_ADUE);
+
+    // ask for clock interrupts (start.c:43-44).
+    timerinit();
 
     // keep each hart's hartid in its tp register, for cpuid() (start.c:46-48).
     w_tp(r_mhartid());

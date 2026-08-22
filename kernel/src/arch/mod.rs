@@ -11,7 +11,7 @@ pub const PAGE_SIZE: usize = 4096;
 pub mod riscv64;
 
 #[cfg(target_arch = "riscv64")]
-pub use riscv64::{cpu_id, intr_get, intr_off, intr_on};
+pub use riscv64::{cpu_id, intr_get, intr_off, intr_on, wait_for_interrupt};
 
 #[cfg(target_arch = "riscv64")]
 pub use riscv64::vm::{activate, kstack, PageTable, Perm};
