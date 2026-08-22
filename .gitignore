@@ -1,0 +1,17 @@
+# === RUST ===
+target/
+**/*.rs.bk
+*.pdb
+
+# === ARTIFACTS ===
+fs.img
+*.asm
+*.sym
+.gdbinit
+
+# === AI TOOLING ===
+.agent-tasks/
+.outline/
+
+# === EMPIRICAL ===
+/.references/
