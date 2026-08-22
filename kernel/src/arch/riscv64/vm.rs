@@ -11,12 +11,12 @@ use crate::mm::addr::{px, PhysAddr, VirtAddr};
 use crate::mm::frame::PhysFrame;
 use crate::mm::kalloc;
 
-// PTE permission bits (riscv.h:395-399). PTE_U joins in M4, with the
-// first user mapping.
+// PTE permission bits (riscv.h:395-399).
 const PTE_V: u64 = 1 << 0;
 const PTE_R: u64 = 1 << 1;
 const PTE_W: u64 = 1 << 2;
 const PTE_X: u64 = 1 << 3;
+const PTE_U: u64 = 1 << 8;
 
 /// SATP mode for Sv39 (riscv.h:246).
 const SATP_SV39: u64 = 8 << 60;
@@ -24,9 +24,13 @@ const SATP_SV39: u64 = 8 << 60;
 /// Highest usable virtual address, `1 << 38` (riscv.h:417).
 pub const MAXVA: u64 = 1 << 38;
 
-/// The trampoline's virtual address, `MAXVA - PGSIZE` (memlayout.h:48).
-/// Mapped in M4, when the trampoline page itself exists.
+/// The trampoline's virtual address, `MAXVA - PGSIZE` (memlayout.h:48),
+/// mapped in both the kernel and every user page table.
 pub const TRAMPOLINE: VirtAddr = VirtAddr(MAXVA - PAGE_SIZE as u64);
+
+/// The per-process trapframe page, just below the trampoline
+/// (`TRAPFRAME = TRAMPOLINE - PGSIZE`, memlayout.h:60).
+pub const TRAPFRAME: VirtAddr = VirtAddr(TRAMPOLINE.0 - PAGE_SIZE as u64);
 
 /// Virtual address of process `p`'s kernel stack; each is followed by an
 /// unmapped guard page (`KSTACK(p)`, memlayout.h:52).
@@ -35,8 +39,7 @@ pub const fn kstack(p: usize) -> VirtAddr {
 }
 
 /// Page permissions: the arch-neutral bit set of the seam, encoded here
-/// as PTE_{R,W,X} (riscv.h:396-398); `Perm::U` joins in M4 with the
-/// first user mapping.
+/// as PTE_{R,W,X,U} (riscv.h:396-399).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Perm(u64);
 
@@ -47,10 +50,19 @@ impl Perm {
     pub const W: Perm = Perm(PTE_W);
     /// Executable.
     pub const X: Perm = Perm(PTE_X);
+    /// User-mode accessible (PTE_U, riscv.h:399).
+    pub const U: Perm = Perm(PTE_U);
 
     /// The PTE bits of this permission set.
     pub const fn bits(self) -> u64 {
         self.0
+    }
+
+    /// Build a `Perm` from raw PTE flag bits (`PTE_FLAGS(*pte)`,
+    /// riscv.h:406 — the low 10 bits of a PTE), as `uvmcopy` does to
+    /// carry a mapping's permissions into the copy.
+    pub const fn from_pte_flags(flags: u64) -> Perm {
+        Perm(flags & 0x3ff)
     }
 }
 
@@ -140,6 +152,42 @@ impl PageTable {
             p += page;
         }
         Ok(())
+    }
+
+    /// Read the raw leaf PTE for `va` without allocating — `walk(pt, va,
+    /// 0)` then inspect. `None` if any intermediate entry is missing or
+    /// the leaf is invalid (vm.c:108-116).
+    pub fn leaf_pte(&self, va: u64) -> Option<u64> {
+        let pte = walk(self.root, va, false)?;
+        // SAFETY: `walk` returned the leaf PTE slot inside a page owned
+        // by this table (module invariant as in `map_range`), and the
+        // read is unaliased.
+        let pte = unsafe { *pte };
+        (pte & PTE_V != 0).then_some(pte)
+    }
+
+    /// Remove the leaf mapping for `va`, returning the physical address
+    /// it referred to (`*pte = 0` in uvmunmap, vm.c:211-212). `None` if
+    /// there was no mapping — uvmunmap's "It's OK if the mappings don't
+    /// exist". The returned address carries no ownership: the caller
+    /// decides whether to free the frame.
+    pub fn take_leaf(&mut self, va: u64) -> Option<PhysAddr> {
+        let slot = walk(self.root, va, false)?;
+        // SAFETY: `walk` returned the leaf PTE slot inside a page owned
+        // by this table (module invariant as in `map_range`); the reads
+        // and the clear are unaliased.
+        let pte = unsafe { *slot };
+        if pte & PTE_V == 0 {
+            return None;
+        }
+        unsafe { *slot = 0 };
+        Some(PhysAddr(pte2pa(pte)))
+    }
+
+    /// The `satp` value that activates this table
+    /// (`MAKE_SATP(p->pagetable)`, riscv.h:248).
+    pub fn satp_value(&self) -> u64 {
+        SATP_SV39 | (self.root.0 >> 12)
     }
 
     /// Surrender the table to forever-static ownership (the kernel page

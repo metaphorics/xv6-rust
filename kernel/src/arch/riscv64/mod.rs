@@ -4,8 +4,10 @@ pub mod entry;
 pub mod intr;
 pub mod kernelvec;
 pub mod start;
+pub mod swtch;
+pub mod trampoline;
+pub mod trapframe;
 pub mod vm;
-
 use core::arch::asm;
 
 // sstatus.SIE: supervisor-mode interrupt enable (riscv.h:47).
@@ -102,6 +104,17 @@ pub fn r_time() -> usize {
     let v;
     // SAFETY: reading a CSR into a local; no memory is touched.
     unsafe { asm!("csrr {v}, time", v = out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+/// Read `satp`, the active page-table base (`r_satp`, riscv.h:53-58;
+/// `prepare_return` saves it into the trapframe, trap.c:114).
+pub fn r_satp() -> usize {
+    let v;
+    // SAFETY: reading a CSR; no memory is touched.
+    unsafe {
+        asm!("csrr {}, satp", out(reg) v, options(nomem, nostack));
+    }
     v
 }
 

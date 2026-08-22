@@ -10,7 +10,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use super::addr::{PhysAddr, VirtAddr};
 use super::kalloc;
 use super::layout::{KERNBASE, PHYSTOP, PLIC, PLIC_SIZE, UART0, VIRTIO0};
-use crate::arch::{self, kstack, PageTable, Perm};
+use crate::arch::riscv64::trampoline;
+use crate::arch::{self, kstack, PageTable, Perm, TRAMPOLINE};
 use crate::params::NPROC;
 
 unsafe extern "C" {
@@ -59,8 +60,16 @@ pub fn init() {
         Perm::R | Perm::W,
     );
 
-    // The trampoline mapping (TRAMPOLINE -> trampoline page, vm.c:46-47)
-    // lands in M4, when the trampoline page itself exists.
+    // map the trampoline page at the highest virtual address, for the
+    // return to user space (vm.c:46-47). RX: it is code, and only the
+    // supervisor executes it.
+    kvmmap(
+        &mut pt,
+        VirtAddr(TRAMPOLINE.0),
+        PhysAddr(trampoline::addr() as u64),
+        PAGE,
+        Perm::R | Perm::X,
+    );
 
     // allocate and map a kernel stack for each process, each under an
     // unmapped guard page (proc_mapstacks, proc.c:33-44).

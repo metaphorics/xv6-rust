@@ -1,7 +1,7 @@
 /* Linker script for the riscv64 kernel: base 0x80000000, ENTRY(_entry),
- * sections per .references/xv6-riscv/kernel/kernel.ld minus the
- * trampoline capture (M4). kernel/.cargo/config.toml passes this file to
- * the linker with -T; keep the relative path in sync. */
+ * sections per .references/xv6-riscv/kernel/kernel.ld including the
+ * one-page trampoline capture in .text. kernel/.cargo/config.toml passes
+ * this file to the linker with -T; keep the relative path in sync. */
 OUTPUT_ARCH(riscv)
 ENTRY(_entry)
 
@@ -19,9 +19,13 @@ SECTIONS
         *(.text.entry)
         *(.text .text.*)
         . = ALIGN(0x1000);
-        /* The trampoline page is captured here once trampoline.S exists
-         * (M4): `_trampoline = .; *(trampsec)` followed by a one-page
-         * ASSERT, as kernel.ld:16-19 does. */
+        /* The trampoline must start on a page boundary so it can be
+         * mapped at TRAMPOLINE in both the kernel and user page tables
+         * (kernel.ld:16-19). */
+        _trampoline = .;
+        *(trampsec)
+        . = ALIGN(0x1000);
+        ASSERT(. - _trampoline == 0x1000, "error: trampoline larger than one page");
         PROVIDE(etext = .);
     }
 
