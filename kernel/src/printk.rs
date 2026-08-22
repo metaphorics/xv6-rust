@@ -18,8 +18,8 @@ use crate::sync::SpinLock;
 /// `panicked` provides in printk.c:130.
 static PANICKED: AtomicBool = AtomicBool::new(false);
 
-/// `fmt` sink for ordinary kernel output: through the UART's
-/// interrupt-driven transmit ring.
+/// `fmt` sink for ordinary kernel output: through `consputc`, the
+/// polled uart path printk uses (printk.c:41-42 -> console.c:35-45).
 pub struct Writer;
 
 impl Write for Writer {
@@ -31,7 +31,7 @@ impl Write for Writer {
             }
         }
         for &b in s.as_bytes() {
-            uart16550::put(b);
+            crate::dev::console::putc(u32::from(b));
         }
         Ok(())
     }

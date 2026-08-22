@@ -65,8 +65,8 @@ pub fn intr(c: u8) {
     let c = u32::from(c);
 
     if c == ctrl(b'P') {
-        // Print process list (console.c:152-154): `procdump` joins with
-        // the process table (M4); there is nothing to dump yet.
+        // Print the process list (console.c:152-154).
+        crate::proc::procdump();
     } else if c == ctrl(b'U') {
         // Kill line (console.c:155-161).
         while cons.e != cons.w && cons.buf[((cons.e - 1) as usize) % INPUT_BUF_SIZE] != b'\n' {
@@ -86,21 +86,43 @@ pub fn intr(c: u8) {
             c
         };
 
-        // echo back to the user (console.c:173-174).
+        // Echo back to the user (console.c:173-174).
         putc(c);
 
-        // store for consumption by the read path (console.c:176-177).
+        // Store for consumption by the read path (console.c:176-177).
         let slot = cons.e as usize % INPUT_BUF_SIZE;
         cons.buf[slot] = c as u8;
         cons.e += 1;
 
         if c == u32::from(b'\n') || c == ctrl(b'D') || cons.e - cons.r == INPUT_BUF_SIZE as u32 {
-            // a whole line (or end-of-file, or a full buffer) has
-            // arrived; the wakeup of the read path (console.c:179-184)
-            // joins with sleep/wakeup (M4).
+            // A whole line (or end-of-file, or a full buffer) has
+            // arrived; wake the read path (console.c:179-184). The
+            // reader itself joins with the file table (M5) and sleeps
+            // on this lock's channel.
             cons.w = cons.e;
+            crate::proc::wakeup(CONS.chan());
         }
     }
+}
+
+/// User `write` system calls to the console arrive here
+/// (`consolewrite`, console.c:60-78): move 32-byte batches from the
+/// caller's buffer and hand them to the uart's blocking writer.
+pub fn write(user_src: bool, src: u64, n: usize) -> usize {
+    let mut buf = [0u8; 32]; // move batches from user space to uart.
+    let mut i = 0;
+    while i < n {
+        let mut nn = buf.len();
+        if nn > n - i {
+            nn = n - i;
+        }
+        if crate::proc::either_copy_in(&mut buf[..nn], user_src, src + i as u64).is_err() {
+            break;
+        }
+        uart16550::write(&buf[..nn]);
+        i += nn;
+    }
+    i
 }
 
 /// Bring up the console (`consoleinit`, console.c:193-203): the input

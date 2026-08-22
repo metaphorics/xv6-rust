@@ -1,19 +1,16 @@
 //! 16550A UART driver for the QEMU `virt` machine: byte-wide registers
 //! memory-mapped at `UART0` (`memlayout.h:21`, `uart.c:14-22`).
 //!
-//! Transmit is interrupt-driven through a 32-byte ring: `put` enqueues
-//! and `start` feeds the hardware; the transmit interrupt drains what
-//! `start` left behind. This reference tree instead blocks writers on a
-//! sleeplock and wakes them from `uartintr` (uart.c:42-43, 80-96,
-//! 143-146) — a shape that needs `sleep`/`wakeup`, which arrive with
-//! processes (M4). Until then the ring carries kernel output; see the
-//! milestone report for the layering note.
+//! Two output paths, as in C: `uartwrite` for processes (serialized by
+//! the transmit sleep lock, sleeping until the transmitter goes idle —
+//! uart.c:78-96), and `putc_sync` for kernel printk and echo, which
+//! polls and never sleeps (uart.c:99-120). `uartintr` wakes blocked
+//! writers and hands input to the console (uart.c:138-155).
 
 use core::ptr;
 
-use crate::arch;
-use crate::dev::console;
-use crate::sync::SpinLock;
+use crate::proc;
+use crate::sync::{pop_off, push_off, SleepLock};
 
 /// UART0 MMIO base (`memlayout.h:21`).
 const UART0: usize = 0x1000_0000;
@@ -37,139 +34,87 @@ const LCR_BAUD_LATCH: u8 = 0x80; // bit 7: baud-rate latch mode (uart.c:36)
 const LSR_RX_READY: u8 = 0x01; // bit 0: input is waiting in RHR (uart.c:38)
 const LSR_TX_IDLE: u8 = 0x20; // bit 5: THR can accept a byte (uart.c:39)
 
-/// Transmit ring size (`UART_TX_BUF_SIZE`).
-const UART_TX_BUF_SIZE: u64 = 32;
+/// Serializes sending threads (`tx_lock`, uart.c:43).
+static TX_LOCK: SleepLock = SleepLock::new();
 
-/// The transmit ring: a byte buffer with monotonically growing read and
-/// write cursors (`uart_tx_buf`/`uart_tx_r`/`uart_tx_w`).
-struct Tx {
-    buf: [u8; UART_TX_BUF_SIZE as usize],
-    /// Next index to fill.
-    w: u64,
-    /// Next index to send.
-    r: u64,
-}
-
-/// One lock serializes every ring access (`uart_tx_lock`).
-static TX: SpinLock<Tx> = SpinLock::new(Tx {
-    buf: [0; UART_TX_BUF_SIZE as usize],
-    w: 0,
-    r: 0,
-});
+/// The wait channel for threads blocked on the transmitter (`tx_chan`,
+/// uart.c:44) — only its address matters.
+static TX_CHAN: u8 = 0;
 
 /// Read one UART register.
 fn read_reg(reg: u8) -> u8 {
-    // SAFETY: a single byte-wide volatile load from the 16550's fixed
-    // MMIO window; the device owns that memory and the volatile access
-    // is the whole point of the read (uart.c:19).
-    unsafe { ptr::read_volatile((UART0 + usize::from(reg)) as *const u8) }
+    // SAFETY: MMIO register read at the driver's fixed device address;
+    // the 16550 has no other accessor, and reads have no side effects
+    // beyond the device's own (the ISR read acknowledges interrupts).
+    unsafe { ptr::read_volatile((UART0 + reg as usize) as *const u8) }
 }
 
 /// Write one UART register.
 fn write_reg(reg: u8, value: u8) {
-    // SAFETY: a single byte-wide volatile store into the 16550's fixed
-    // MMIO window; no Rust-owned memory is touched (uart.c:20).
-    unsafe { ptr::write_volatile((UART0 + usize::from(reg)) as *mut u8, value) }
+    // SAFETY: MMIO register write at the driver's fixed device address.
+    unsafe { ptr::write_volatile((UART0 + reg as usize) as *mut u8, value) }
 }
 
 /// Program the UART: 38.4K baud, 8 data bits, FIFOs on, receive and
 /// transmit interrupts enabled (`uartinit`, `uart.c:48-74`).
 pub fn init() {
-    // disable interrupts.
+    // Disable interrupts.
     write_reg(IER, 0x00);
 
-    // special mode to set baud rate.
+    // Special mode to set baud rate.
     write_reg(LCR, LCR_BAUD_LATCH);
 
-    // LSB for baud rate of 38.4K.
+    // LSB for 38.4K baud.
     write_reg(0, 0x03);
 
-    // MSB for baud rate of 38.4K.
+    // MSB for 38.4K baud.
     write_reg(1, 0x00);
 
-    // leave set-baud mode, and set word length to 8 bits, no parity.
+    // Leave set-baud mode; 8 data bits, no parity.
     write_reg(LCR, LCR_EIGHT_BITS);
 
-    // reset and enable FIFOs.
+    // Reset and enable FIFOs.
     write_reg(FCR, FCR_FIFO_ENABLE | FCR_FIFO_CLEAR);
 
-    // enable transmit and receive interrupts.
+    // Enable transmit and receive interrupts.
     write_reg(IER, IER_TX_ENABLE | IER_RX_ENABLE);
 }
 
-/// If the transmit holding register is idle, feed it bytes from the ring
-/// until it fills or the ring empties (`uartstart`). Transmit interrupts
-/// are enabled while the ring still holds bytes the hardware has not
-/// accepted, and disabled once it drains — the interrupt would otherwise
-/// fire forever on an idle transmitter.
-fn start(tx: &mut Tx) {
-    loop {
-        if tx.w == tx.r {
-            // the ring is empty.
-            let _ = read_reg(ISR);
-            write_reg(IER, read_reg(IER) & !IER_TX_ENABLE);
-            return;
-        }
+/// Transmit `buf` to the uart, blocking while the transmitter is busy
+/// (`uartwrite`, uart.c:78-96). Cannot be called from interrupts — the
+/// writer sleeps — only from the write path.
+pub fn write(buf: &[u8]) {
+    TX_LOCK.acquire();
 
-        if read_reg(LSR) & LSR_TX_IDLE == 0 {
-            // the transmit holding register is full; it will interrupt
-            // when it is ready for a new one.
-            write_reg(IER, read_reg(IER) | IER_TX_ENABLE);
-            return;
+    for &b in buf {
+        // Sleep until the transmit holding register is idle: check, and
+        // if busy sleep on the channel `uartintr` wakes (uart.c:83-96).
+        while read_reg(LSR) & LSR_TX_IDLE == 0 {
+            proc::sleep0((&raw const TX_CHAN) as usize);
         }
-
-        let c = tx.buf[(tx.r % UART_TX_BUF_SIZE) as usize];
-        tx.r += 1;
-        write_reg(THR, c);
+        write_reg(THR, b);
     }
-}
 
-/// Write one output character through the transmit ring, waiting while
-/// the ring is full (`uartputc`).
-///
-/// The wait only makes progress if the transmit interrupt can run, which
-/// requires interrupts enabled; with interrupts disabled (trap handlers,
-/// panic paths) the character goes out on the polled path instead, so
-/// kernel output can never wedge on a full ring.
-pub fn put(c: u8) {
-    loop {
-        {
-            let mut tx = TX.lock();
-            if tx.w - tx.r < UART_TX_BUF_SIZE {
-                let slot = (tx.w % UART_TX_BUF_SIZE) as usize;
-                tx.buf[slot] = c;
-                tx.w += 1;
-                start(&mut tx);
-                return;
-            }
-        }
-
-        if !arch::intr_get() {
-            // no interrupt can drain the ring from here.
-            putc_sync(c);
-            return;
-        }
-        core::hint::spin_loop();
-    }
+    TX_LOCK.release();
 }
 
 /// Write one byte without using interrupts, polling the line status
 /// register until the transmit holding register is free (`uartputc_sync`,
 /// uart.c:102-120). Brackets the poll with `push_off`/`pop_off` so an
 /// interrupt on this hart cannot disturb the polling loop. This is the
-/// echo and panic path (the panic freeze lives in `printk`).
+/// printk and echo path (the panic freeze lives in `printk`).
 pub fn putc_sync(c: u8) {
-    crate::sync::push_off();
-    // wait for UART to set Transmit Holding Empty in LSR.
+    push_off();
+    // Wait for UART to set Transmit Holding Empty in LSR.
     while read_reg(LSR) & LSR_TX_IDLE == 0 {}
     write_reg(THR, c);
-    crate::sync::pop_off();
+    pop_off();
 }
 
 /// Try to read one input character from the UART; `None` if none is
 /// waiting (`uartgetc`, uart.c:124-133).
 fn getc() -> Option<u8> {
-    // is input ready?
+    // Is input ready?
     if read_reg(LSR) & LSR_RX_READY != 0 {
         Some(read_reg(RHR))
     } else {
@@ -178,19 +123,20 @@ fn getc() -> Option<u8> {
 }
 
 /// Handle a UART interrupt, raised because input has arrived, or the
-/// UART is ready for more output, or both (`uartintr`, uart.c:139-155).
+/// UART is ready for more output, or both (`uartintr`, uart.c:138-155).
 /// Called from `devintr`.
 pub fn intr() {
-    // acknowledge the interrupt (uart.c:141).
+    // Acknowledge the interrupt (uart.c:141).
     let _ = read_reg(ISR);
 
-    // read and process incoming characters, if any (uart.c:148-154).
-    while let Some(c) = getc() {
-        console::intr(c);
+    if read_reg(LSR) & LSR_TX_IDLE != 0 {
+        // UART finished transmitting; wake the sending thread
+        // (uart.c:143-146).
+        proc::wakeup((&raw const TX_CHAN) as usize);
     }
 
-    // send buffered characters (the counterpart of waking the blocked
-    // writer, uart.c:143-146).
-    let mut tx = TX.lock();
-    start(&mut tx);
+    // Read and process incoming characters, if any (uart.c:148-154).
+    while let Some(c) = getc() {
+        crate::dev::console::intr(c);
+    }
 }

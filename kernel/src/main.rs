@@ -17,9 +17,13 @@ mod printk;
 mod arch;
 mod cpu;
 mod dev;
+mod err;
 mod mm;
 mod params;
+mod proc;
 mod sync;
+mod syscall;
+mod sysproc;
 mod trap;
 
 use core::sync::atomic::{AtomicBool, Ordering};

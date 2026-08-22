@@ -1,8 +1,11 @@
-//! Synchronization primitives (`spinlock.h`; `sleeplock.c` later).
+//! Synchronization primitives (`spinlock.h`, `sleeplock.h`).
 //!
-//! `SpinLock` is the only primitive this far: mutual exclusion with
-//! xv6's interrupt discipline.
+//! `SpinLock` (mutual exclusion with xv6's interrupt discipline) and
+//! `SleepLock` (sleeping waiters over the sleep/wakeup channel
+//! protocol).
 
+mod sleeplock;
 mod spin;
 
-pub use spin::{pop_off, push_off, SpinLock};
+pub use sleeplock::SleepLock;
+pub use spin::{pop_off, push_off, SpinGuard, SpinLock};

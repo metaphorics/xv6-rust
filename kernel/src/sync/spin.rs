@@ -95,6 +95,34 @@ impl<T> SpinLock<T> {
         self.locked.store(false, Ordering::Release);
         pop_off();
     }
+
+    /// This lock's address, usable as a sleep channel — the C kernel
+    /// sleeps on the address of the lock-protected condition (e.g.
+    /// `sleep(&ticks, &tickslock)`, trap.c/sysproc.c).
+    pub fn chan(&self) -> usize {
+        self as *const Self as usize
+    }
+
+    /// Release without going through a guard: the scheduler/forkret
+    /// handshake points, where the lock must stay held across a
+    /// context switch and the paired release happens in a different
+    /// call frame (forkret releasing what scheduler acquired, and the
+    /// post-`sched` releases inside proc). Panics unless this hart
+    /// holds the lock, exactly like `release`.
+    pub(crate) fn release_raw(&self) {
+        self.release();
+    }
+
+    /// Run `f` on the protected data while this hart already holds the
+    /// lock — the read after `sched()` returns into a flow whose guard
+    /// was consumed before the switch (proc's sleep clears `chan` this
+    /// way). Asserts ownership like `holding`.
+    pub(crate) fn with_held<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        assert!(self.holding(), "with_held: lock not held");
+        // SAFETY: this hart holds the lock (asserted above), so this is
+        // the only live access — the same guarantee a guard provides.
+        unsafe { f(&mut *self.data.get()) }
+    }
 }
 
 /// An acquired `SpinLock`, giving `&mut` access to the protected data.
@@ -102,6 +130,18 @@ impl<T> SpinLock<T> {
 #[must_use = "dropping the guard releases the lock immediately"]
 pub struct SpinGuard<'a, T> {
     lock: &'a SpinLock<T>,
+}
+
+impl<'a, T> SpinGuard<'a, T> {
+    /// Surrender this guard to `proc::sleep`'s release/re-acquire
+    /// handoff: returns the lock it held without releasing it (sleep
+    /// releases under the lost-wakeup ordering and re-acquires before
+    /// returning a fresh guard).
+    pub(crate) fn handoff(self) -> &'a SpinLock<T> {
+        let lock = self.lock;
+        core::mem::forget(self);
+        lock
+    }
 }
 
 impl<T> Deref for SpinGuard<'_, T> {

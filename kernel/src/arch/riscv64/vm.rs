@@ -74,6 +74,12 @@ impl core::ops::BitOr for Perm {
     }
 }
 
+/// Does this raw PTE permit writes (`*pte & PTE_W`)? `copyout` uses the
+/// answer to refuse writes over read-only user pages (vm.c:366-368).
+pub fn pte_writable(pte: u64) -> bool {
+    pte & PTE_W != 0
+}
+
 impl core::ops::BitOrAssign for Perm {
     fn bitor_assign(&mut self, rhs: Perm) {
         self.0 |= rhs.0;
@@ -188,6 +194,15 @@ impl PageTable {
     /// (`MAKE_SATP(p->pagetable)`, riscv.h:248).
     pub fn satp_value(&self) -> u64 {
         SATP_SV39 | (self.root.0 >> 12)
+    }
+
+    /// Look up a user virtual address and return the physical address
+    /// it maps to (`walkaddr`, vm.c:122-139): requires a present leaf
+    /// with PTE_U. `None` if unmapped or not user-accessible. Can only
+    /// be used to look up user pages.
+    pub fn walkaddr(&self, va: u64) -> Option<PhysAddr> {
+        let pte = self.leaf_pte(va)?;
+        (pte & PTE_U != 0).then_some(PhysAddr(pte2pa(pte)))
     }
 
     /// Surrender the table to forever-static ownership (the kernel page
