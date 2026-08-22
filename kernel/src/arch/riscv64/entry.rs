@@ -33,7 +33,6 @@ core::arch::global_asm!(
     ".globl _entry",
     "_entry:",
     "    la      sp, {stack}",
-    "    li      a0, 4096",
     "    csrr    a1, mhartid",
     "    addi    a1, a1, 1",
     "    slli    a1, a1, 12",

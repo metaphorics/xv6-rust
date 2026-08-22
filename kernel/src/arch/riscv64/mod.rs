@@ -2,6 +2,7 @@
 
 pub mod entry;
 pub mod start;
+pub mod vm;
 
 use core::arch::asm;
 
