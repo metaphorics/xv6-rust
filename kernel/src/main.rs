@@ -12,8 +12,10 @@
 mod printk;
 
 mod arch;
+mod cpu;
 mod dev;
 mod params;
+mod sync;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 

@@ -67,15 +67,15 @@ pub fn init() {
 }
 
 /// Write one byte without using interrupts, polling the line status
-/// register until the transmit holding register is free. Safe to call
-/// before the trap layer exists; this is the printk path
-/// (`uartputc_sync`, `uart.c:102-120`).
-///
-/// The C version brackets the poll with push_off/pop_off and spins when
-/// the kernel has panicked. The interrupt bracket needs `sync::SpinLock`
-/// (M2), and the panic freeze lives one layer up, in `printk::Writer`.
+/// register until the transmit holding register is free (`uartputc_sync`,
+/// uart.c:102-120). Brackets the poll with `push_off`/`pop_off` so an
+/// interrupt on this hart cannot disturb the polling loop. Safe to call
+/// before the trap layer exists; this is the printk and panic path (the
+/// panic freeze lives one layer up, in `printk::Writer`).
 pub fn putc_sync(c: u8) {
+    crate::sync::push_off();
     // wait for UART to set Transmit Holding Empty in LSR.
     while read_reg(LSR) & LSR_TX_IDLE == 0 {}
     write_reg(THR, c);
+    crate::sync::pop_off();
 }

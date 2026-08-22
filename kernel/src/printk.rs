@@ -1,15 +1,16 @@
 //! Kernel console output: `print!`/`println!` and the panic handler
 //! (`kernel/printk.c`).
 //!
-//! The writer is deliberately unsynchronized: at this milestone only one
-//! hart prints and interrupts are off. The `printk.c` pr lock
-//! (`sync::SpinLock`) wraps `Writer` once concurrent printers exist; the
-//! macro interface is final.
+//! The writer is serialized by `sync::SpinLock` — the C `pr` lock. The
+//! panic path deliberately bypasses the lock and drives the polled UART
+//! directly (`putc_sync`), so a panic while another hart holds the lock
+//! still gets its message out.
 
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::dev::uart16550;
+use crate::sync::SpinLock;
 
 /// Set by the panic handler once the panic message is out. Any other hart
 /// reaching a print spins instead of touching the UART, the freeze that
@@ -34,12 +35,15 @@ impl Write for Writer {
     }
 }
 
+/// The console lock (the `pr` spinlock, printk.c).
+pub(crate) static PRINTK: SpinLock<Writer> = SpinLock::new(Writer);
+
 /// Print to the console without a trailing newline.
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {{
-        let mut writer = $crate::printk::Writer;
-        let _ = core::fmt::write(&mut writer, format_args!($($arg)*));
+        let mut writer = $crate::printk::PRINTK.lock();
+        let _ = core::fmt::write(&mut *writer, format_args!($($arg)*));
     }};
 }
 
@@ -55,7 +59,8 @@ macro_rules! println {
 }
 
 /// Print the panic message, freeze every other hart's console output, and
-/// spin (`panic`, `printk.c:125-133`). Uses only the polled UART path.
+/// spin (`panic`, printk.c:125-133). Lock-free: only the polled UART
+/// path, so it is safe regardless of what locks the panicking hart held.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     let mut writer = Writer;
