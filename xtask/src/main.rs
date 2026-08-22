@@ -25,6 +25,9 @@ use std::time::{Duration, Instant};
 /// How long `run` waits for the expected banner before killing QEMU.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the echo test waits for each echoed line.
+const ECHO_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn main() {
     let mut args = std::env::args();
     let program = args.next();
@@ -32,19 +35,23 @@ fn main() {
     let rest: Vec<String> = args.collect();
     match subcommand.as_deref() {
         Some("check") if rest.is_empty() => check(),
-        Some("run") => run(&parse_arch(&rest, program.as_deref())),
+        Some("run") => {
+            let arch = parse_arch(&rest, program.as_deref());
+            let echo_test = rest.iter().any(|arg| arg == "--echo-test");
+            run(&arch, echo_test);
+        }
         _ => usage(program.as_deref()),
     }
 }
 
 fn parse_arch(args: &[String], program: Option<&str>) -> String {
-    if let [flag, arch] = args
-        && flag == "--arch"
+    if let Some(pos) = args.iter().position(|arg| arg == "--arch")
+        && let Some(arch) = args.get(pos + 1)
     {
         return arch.clone();
     }
     let name = program.unwrap_or("cargo xtask");
-    eprintln!("{name}: 'run' expects exactly one '--arch <riscv64>' argument");
+    eprintln!("{name}: 'run' expects an '--arch <riscv64>' argument");
     std::process::exit(2);
 }
 
@@ -86,9 +93,14 @@ fn check() {
     );
 }
 
-/// Build the kernel for its default target and boot it in QEMU until the
-/// expected banner appears on the serial console.
-fn run(arch: &str) {
+/// Build the kernel for its default target and boot it in QEMU.
+///
+/// Without `--echo-test`, wait for the boot banner and exit. With it,
+/// drive the guest console: wait for the interrupts-live banner, send
+/// `abc`, expect the echo, sit out a timer-tick window, then send `def`
+/// and expect that echo too — proving timer interrupts never wedged the
+/// hart that serves the UART.
+fn run(arch: &str, echo_test: bool) {
     if arch != "riscv64" {
         eprintln!(
             "xtask: --arch {arch} is not bootable yet; only riscv64 is \
@@ -99,6 +111,9 @@ fn run(arch: &str) {
     let root = workspace_root();
     let kernel = build_kernel(root);
     let qemu = require_qemu();
+    if echo_test {
+        boot_and_echo(qemu, &kernel);
+    }
     boot_and_expect(qemu, &kernel, "xv6-rust kernel is booting");
 }
 
@@ -201,10 +216,10 @@ fn require_qemu() -> &'static str {
     qemu
 }
 
-/// Boot `kernel` under QEMU on the `virt` machine and wait for `expect` to
-/// appear on the serial console. Prints QEMU's output as it arrives; exits
-/// 0 on match, 1 on timeout or early exit.
-fn boot_and_expect(qemu: &str, kernel: &Path, expect: &str) -> ! {
+/// Boot `kernel` under QEMU on the `virt` machine, piping stdin when
+/// `interactive`. Returns the child plus a channel carrying each line of
+/// serial output as it arrives.
+fn spawn_qemu(qemu: &str, kernel: &Path, interactive: bool) -> (Child, mpsc::Receiver<String>) {
     let mut child = match Command::new(qemu)
         .args([
             "-machine",
@@ -219,7 +234,11 @@ fn boot_and_expect(qemu: &str, kernel: &Path, expect: &str) -> ! {
             "-kernel",
         ])
         .arg(kernel)
-        .stdin(Stdio::null())
+        .stdin(if interactive {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -252,24 +271,25 @@ fn boot_and_expect(qemu: &str, kernel: &Path, expect: &str) -> ! {
             }
         });
     }
+    (child, rx)
+}
 
-    let deadline = Instant::now() + BOOT_TIMEOUT;
+/// Wait until a serial line containing `expect` arrives; kill the child
+/// and exit non-zero on timeout or a closed output stream.
+fn wait_for(child: &mut Child, rx: &mpsc::Receiver<String>, expect: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
     loop {
         // `saturating_duration_since` so an expired deadline simply turns
         // into an immediate `Timeout` below instead of panicking.
         let remaining = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(remaining) {
-            Ok(line) if line.contains(expect) => {
-                println!("XTASK: ok");
-                kill(&mut child);
-                std::process::exit(0);
-            }
+            Ok(line) if line.contains(expect) => return,
             Ok(_) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                kill(&mut child);
+                kill(child);
                 eprintln!(
                     "xtask: timed out after {} s waiting for '{expect}'",
-                    BOOT_TIMEOUT.as_secs()
+                    timeout.as_secs()
                 );
                 std::process::exit(1);
             }
@@ -277,11 +297,64 @@ fn boot_and_expect(qemu: &str, kernel: &Path, expect: &str) -> ! {
                 // The reader thread is gone: either QEMU exited or our
                 // own stdout was closed. Kill rather than wait, so a
                 // still-running QEMU cannot wedge the harness.
-                kill(&mut child);
+                kill(child);
                 eprintln!("xtask: qemu output ended before printing '{expect}'");
                 std::process::exit(1);
             }
         }
+    }
+}
+
+/// Boot `kernel` under QEMU and wait for `expect` to appear on the serial
+/// console. Prints QEMU's output as it arrives; exits 0 on match, 1 on
+/// timeout or early exit.
+fn boot_and_expect(qemu: &str, kernel: &Path, expect: &str) -> ! {
+    let (mut child, rx) = spawn_qemu(qemu, kernel, false);
+    wait_for(&mut child, &rx, expect, BOOT_TIMEOUT);
+    println!("XTASK: ok");
+    kill(&mut child);
+    std::process::exit(0);
+}
+
+/// Boot `kernel` and exercise the interrupt-driven console end to end:
+/// wait for the interrupts-live banner, send `abc` and expect its echo,
+/// sit out a window of timer ticks, then send `def` and expect that echo
+/// too — proving clock interrupts never wedged the hart serving the UART.
+fn boot_and_echo(qemu: &str, kernel: &Path) -> ! {
+    let (mut child, rx) = spawn_qemu(qemu, kernel, true);
+
+    // Interrupts are the last thing hart 0 enables before parking.
+    wait_for(&mut child, &rx, "xv6-rust: interrupts live", BOOT_TIMEOUT);
+
+    // Let the boot output drain and every hart reach its park.
+    thread::sleep(Duration::from_millis(500));
+    send(&mut child, "abc\n");
+    wait_for(&mut child, &rx, "abc", ECHO_TIMEOUT);
+
+    // The liveness window: ~15 timer ticks pass before the second echo.
+    thread::sleep(Duration::from_millis(1500));
+    send(&mut child, "def\n");
+    wait_for(&mut child, &rx, "def", ECHO_TIMEOUT);
+
+    println!("XTASK: echo ok");
+    kill(&mut child);
+    std::process::exit(0);
+}
+
+/// Write one line to the guest console over QEMU's piped stdin.
+fn send(child: &mut Child, text: &str) {
+    let Some(stdin) = child.stdin.as_mut() else {
+        kill(child);
+        eprintln!("xtask: qemu stdin is not piped");
+        std::process::exit(1);
+    };
+    if let Err(err) = stdin
+        .write_all(text.as_bytes())
+        .and_then(|()| stdin.flush())
+    {
+        kill(child);
+        eprintln!("xtask: could not write to qemu stdin: {err}");
+        std::process::exit(1);
     }
 }
 
@@ -310,11 +383,13 @@ fn step(what: &str, cmd: &mut Command) {
 fn usage(program: Option<&str>) -> ! {
     let name = program.unwrap_or("cargo xtask");
     eprintln!("usage: {name} <check>");
-    eprintln!("       {name} run --arch <riscv64>");
+    eprintln!("       {name} run --arch <riscv64> [--echo-test]");
     eprintln!();
     eprintln!("subcommands:");
     eprintln!("  check  rustfmt, clippy -D warnings (host + riscv64gc targets), host tests");
     eprintln!("  run    build the kernel and boot it in QEMU until the banner appears");
+    eprintln!("         --echo-test: also send abc/def and expect the console echo back,");
+    eprintln!("         proving uart + timer interrupts stay live");
     std::process::exit(2);
 }
 
