@@ -29,6 +29,8 @@
 //! [`SpinLock::release_raw`] on a forgotten guard — every use is
 //! paired and documented.
 
+pub mod initcode;
+
 use core::cell::UnsafeCell;
 use core::mem;
 use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
@@ -267,14 +269,6 @@ impl CurrentProc {
     pub fn name_bytes(&self) -> [u8; 16] {
         // SAFETY: as `sz`.
         unsafe { private(self.proc()) }.name
-    }
-
-    /// Set the name from a nul-terminated-in-16 slice (`safestrcpy`).
-    pub fn set_name(&self, name: &[u8]) {
-        // SAFETY: as `sz`.
-        let private = unsafe { private_mut(self.proc()) };
-        private.name = [0; 16];
-        private.name[..name.len()].copy_from_slice(name);
     }
 
     /// The name as a displayable value, up to the first nul.
@@ -639,7 +633,6 @@ pub fn fork() -> Result<usize, Err> {
     nprivate.name = p.name_bytes();
     let pid = nshared.pid;
     drop(nshared);
-    drop(nprivate);
 
     let wl = WAIT_LOCK.lock();
     set_parent_slot(nslot, Some(p.slot()));
@@ -778,23 +771,6 @@ pub fn grow(n: i64) -> Result<(), Err> {
     Ok(())
 }
 
-/// Copy to either a user or kernel address (`either_copyout`,
-/// proc.c:641-654). The user destination is validated page by page.
-pub fn either_copy_out(user_dst: bool, dstva: u64, src: &[u8]) -> Result<(), Err> {
-    if !user_dst {
-        // SAFETY: the caller passes a kernel address of `src.len()`
-        // readable bytes — the syscall layer only hands kernel buffers
-        // here (memmove, proc.c:651).
-        unsafe {
-            core::ptr::copy_nonoverlapping(src.as_ptr(), dstva as usize as *mut u8, src.len());
-        }
-        Ok(())
-    } else {
-        let p = my_proc().expect("either_copy_out: no current proc");
-        uvm::copy_out(p.pagetable(), dstva, src)
-    }
-}
-
 /// Copy from either a user or kernel address (`either_copyin`,
 /// proc.c:656-669).
 pub fn either_copy_in(dst: &mut [u8], user_src: bool, srcva: u64) -> Result<(), Err> {
@@ -852,4 +828,38 @@ pub fn procdump() {
         let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
         println!("{} {} {}", shared.pid, state, as_str(&name[..end]));
     }
+}
+
+/// Set up the first user process (`userinit`, proc.c:217-227 — this
+/// reference's exec-/init form is replaced by the classic initcode image
+/// until exec lands in M6; see `initcode`). The slot stays holding its
+/// `shared` lock across the body, released at the end.
+pub fn user_init() {
+    let (slot, mut shared) = allocproc().expect("userinit: allocproc");
+    INITPROC.store(slot, Ordering::Release);
+
+    // SAFETY: the slot's shared lock is held with state Used — the
+    // alloc path's sanctioned private access.
+    let private = unsafe { private_mut(&PROCS[slot]) };
+
+    // One page of user memory at va 0 holding the initcode image
+    // (uvminit: map, zero, copy).
+    uvm::init(
+        private.pagetable.as_mut().expect("userinit: pagetable"),
+        &initcode::INITCODE,
+    );
+    private.sz = PAGE_SIZE as u64;
+
+    // User program counter at main, user stack pointer at the page top
+    // (proc.c:222-223).
+    let tf = private.trapframe();
+    tf.epc = 0;
+    tf.sp = PAGE_SIZE as u64;
+
+    private.name = *b"initcode\0\0\0\0\0\0\0\0";
+
+    // cwd = namei("/") joins with the file system (M5).
+
+    shared.state = ProcState::Runnable;
+    drop(shared);
 }

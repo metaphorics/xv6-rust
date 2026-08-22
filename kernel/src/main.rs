@@ -8,8 +8,8 @@
 //! mode). Hart 0 brings up the console, the frame allocator and the
 //! kernel page table, then the trap vector, the PLIC and interrupts;
 //! the other harts wait for the release flag, repeat the per-hart steps
-//! (`main.c:34-42`), and every hart parks in `wait_for_interrupt` until
-//! the scheduler replaces the park (main.c:44).
+//! (`main.c:34-42`); every hart then enters the process scheduler, the
+//! idle loop from here on (main.c:44).
 
 #[macro_use]
 mod printk;
@@ -28,14 +28,13 @@ mod trap;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::arch::riscv64::intr;
-
 /// Set by hart 0 once its boot work is done; non-boot harts spin on it
 /// (`__atomic_store_n(&started, 1, __ATOMIC_RELEASE)`, main.c:33).
 static BOOT_RELEASE: AtomicBool = AtomicBool::new(false);
 
-/// Supervisor-mode entry, the `mret` target of `start`, with the hart id
-/// in `a0`.
+use crate::arch::riscv64::intr;
+
+/// Set by hart 0 once its boot work is done; non-boot harts spin on it
 extern "C" fn main(hartid: usize) -> ! {
     if hartid != 0 {
         // Wait for hart 0's boot (main.c:34-35).
@@ -47,11 +46,7 @@ extern "C" fn main(hartid: usize) -> ! {
         mm::kernel_map::activate_hart(); // turn on paging (main.c:39)
         trap::init_hart(); // install kernel trap vector (main.c:40)
         intr::init_hart(hartid); // ask PLIC for device interrupts (main.c:41)
-        // main.c leaves non-boot harts in scheduler(); until M4 they park
-        // with interrupts on so their timer re-arms via kernelvec/clockintr
-        // instead of spinning hot out of `wfi` with STIP pending forever.
-        arch::intr_on();
-        park();
+        proc::scheduler(); // run processes (main.c:44)
     }
 
     dev::console::init(); // consoleinit (main.c:14)
@@ -65,21 +60,9 @@ extern "C" fn main(hartid: usize) -> ! {
     trap::init_hart(); // install kernel trap vector (main.c:24)
     intr::init(); // set up interrupt controller (main.c:25)
     intr::init_hart(0); // ask PLIC for device interrupts (main.c:26)
+    proc::user_init(); // first user process (main.c:30)
 
     BOOT_RELEASE.store(true, Ordering::Release);
 
-    // Interrupts on: in the C kernel this happens inside the scheduler
-    // loop (proc.c); until the scheduler exists, the park below is what
-    // runs with interrupts live.
-    arch::intr_on();
-    println!("xv6-rust: interrupts live");
-    park();
-}
-
-/// Idle until the scheduler (M4) takes over: sleep until an interrupt is
-/// pending, take it through the kernel trap vector, repeat.
-fn park() -> ! {
-    loop {
-        arch::wait_for_interrupt();
-    }
+    proc::scheduler(); // run processes (main.c:44)
 }
