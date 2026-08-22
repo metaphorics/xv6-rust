@@ -34,7 +34,8 @@ static BOOT_RELEASE: AtomicBool = AtomicBool::new(false);
 
 use crate::arch::riscv64::intr;
 
-/// Set by hart 0 once its boot work is done; non-boot harts spin on it
+/// Supervisor-mode entry, the `mret` target of `start`, with the hart id
+/// in `a0`.
 extern "C" fn main(hartid: usize) -> ! {
     if hartid != 0 {
         // Wait for hart 0's boot (main.c:34-35).

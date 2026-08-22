@@ -421,9 +421,9 @@ fn freeproc(slot: usize, shared: &mut SpinGuard<'_, ProcShared>) {
     // SAFETY: caller holds the slot's shared lock — freeproc's
     // precondition (proc.c:154).
     let private = unsafe { private_mut(&PROCS[slot]) };
-    if private.trapframe_page.take().is_some() {
-        // dropping the frame returns the page (kfree, proc.c:158-159)
-    }
+    // Dropping the frame returns the page to the allocator (kfree,
+    // proc.c:158-159).
+    drop(private.trapframe_page.take());
     if let Some(pt) = private.pagetable.take() {
         uvm::free_proc_table(pt, private.sz);
     }
@@ -532,8 +532,9 @@ pub fn yield_now() {
     // process re-acquires it before swtching back.
     mem::forget(shared);
     sched(&p);
-    // Back from the scheduler: this hart re-acquired the lock for us.
-    p.shared().with_held(|shared| shared.state = ProcState::Running);
+    // Back from the scheduler, which set this process Running before
+    // switching back into it; release the lock it re-acquired for us
+    // (proc.c:506-507).
     p.shared().release_raw();
 }
 
