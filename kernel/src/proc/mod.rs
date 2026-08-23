@@ -796,7 +796,7 @@ pub fn wait(status_addr: u64) -> Result<usize, Err> {
                 let pid = shared.pid;
                 if status_addr != 0 {
                     let xstate = shared.xstate.to_le_bytes();
-                    if uvm::copy_out(p.pagetable(), status_addr, &xstate).is_err() {
+                    if uvm::copy_out(p.pagetable_mut(), p.sz(), status_addr, &xstate).is_err() {
                         return Err(Err::BadArg);
                     }
                 }
@@ -874,7 +874,7 @@ pub fn either_copy_in(dst: &mut [u8], user_src: bool, srcva: u64) -> Result<(), 
         Ok(())
     } else {
         let p = my_proc().expect("either_copy_in: no current proc");
-        uvm::copy_in(p.pagetable(), dst, srcva)
+        uvm::copy_in(p.pagetable_mut(), p.sz(), dst, srcva)
     }
 }
 
@@ -889,7 +889,7 @@ pub fn either_copy_out(src: &[u8], user_dst: bool, dstva: u64) -> Result<(), Err
         Ok(())
     } else {
         let p = my_proc().expect("either_copy_out: no current proc");
-        uvm::copy_out(p.pagetable(), dstva, src)
+        uvm::copy_out(p.pagetable_mut(), p.sz(), dstva, src)
     }
 }
 

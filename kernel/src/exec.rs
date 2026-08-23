@@ -126,13 +126,14 @@ pub fn exec(path: &[u8], args: &[&[u8]]) -> Result<usize, Err> {
     let mut sp = image.sz;
     let stack_base = sp - USERSTACK as u64 * PAGE;
     let mut pointers = [0u64; MAXARG + 1];
+    let image_size = image.sz;
     for (index, arg) in args.iter().enumerate() {
         sp = sp.checked_sub((arg.len() + 1) as u64).ok_or(Err::BadArg)? & !15;
         if sp < stack_base {
             return Err(Err::BadArg);
         }
-        uvm::copy_out(image.table(), sp, arg)?;
-        uvm::copy_out(image.table(), sp + arg.len() as u64, &[0])?;
+        uvm::copy_out(image.table_mut(), image_size, sp, arg)?;
+        uvm::copy_out(image.table_mut(), image_size, sp + arg.len() as u64, &[0])?;
         pointers[index] = sp;
     }
 
@@ -146,7 +147,7 @@ pub fn exec(path: &[u8], args: &[&[u8]]) -> Result<usize, Err> {
         let at = slot * size_of::<u64>();
         encoded[at..at + size_of::<u64>()].copy_from_slice(&pointer.to_le_bytes());
     }
-    uvm::copy_out(image.table(), sp, &encoded[..pointer_bytes])?;
+    uvm::copy_out(image.table_mut(), image_size, sp, &encoded[..pointer_bytes])?;
 
     let name = process_name(path);
     let sz = image.sz;

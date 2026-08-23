@@ -202,6 +202,16 @@ impl PageTable {
         unsafe { *slot = 0 };
         Some(PhysAddr(pte2pa(pte)))
     }
+    /// Remove and return the first mapped 4 KiB leaf in `[start, end)`.
+    ///
+    /// The Sv39 tree is traversed by present branches rather than by virtual
+    /// page number, so sparse lazy-sbrk regions cost one scan of their actual
+    /// page-table pages instead of one probe per absent page.
+    pub fn take_next_leaf(&mut self, start: u64, end: u64) -> Option<(u64, PhysAddr)> {
+        let va = next_leaf(self.root, 2, 0, start, end)?;
+        let pa = self.take_leaf(va).expect("next leaf disappeared");
+        Some((va, pa))
+    }
 
     /// The `satp` value that activates this table
     /// (`MAKE_SATP(p->pagetable)`, riscv.h:248).
@@ -276,6 +286,39 @@ fn walk(root: PhysAddr, va: u64, alloc: bool) -> Option<*mut u64> {
     }
     // SAFETY: taking the address of the leaf PTE slot; no access occurs.
     Some(unsafe { core::ptr::addr_of_mut!((*table)[px(0, va)]) })
+}
+/// Find the first mapped level-zero leaf in `[start, end)`, skipping absent
+/// Sv39 branches in one step.
+fn next_leaf(table_pa: PhysAddr, level: usize, base: u64, start: u64, end: u64) -> Option<u64> {
+    if start >= end {
+        return None;
+    }
+    let table = table_of(table_pa);
+    let span = 1u64 << (12 + level * 9);
+    for index in 0..512 {
+        let entry_base = base + index as u64 * span;
+        let entry_end = entry_base + span;
+        if entry_end <= start {
+            continue;
+        }
+        if entry_base >= end {
+            break;
+        }
+        let pte = pte_read(table, index);
+        if pte & PTE_V == 0 {
+            continue;
+        }
+        if level == 0 {
+            return Some(entry_base);
+        }
+        if pte & (PTE_R | PTE_W | PTE_X) != 0 {
+            panic!("next_leaf: huge page");
+        }
+        if let Some(va) = next_leaf(PhysAddr(pte2pa(pte)), level - 1, entry_base, start, end) {
+            return Some(va);
+        }
+    }
+    None
 }
 
 /// Recursively free page-table pages; all leaf mappings must already be

@@ -118,19 +118,48 @@ pub fn free_proc_table(mut pt: PageTable, sz: u64) {
     free(pt, sz)
 }
 
-/// Remove `npages` of mappings starting at `va`, optionally freeing the
-/// physical pages (`uvmunmap`, vm.c:194-213). Missing mappings are fine.
+/// Remove mappings in `[va, va + npages * PGSIZE)`, optionally freeing their
+/// physical pages (`uvmunmap`, vm.c:194-213). Missing Sv39 branches are
+/// skipped rather than probed page by page.
 pub fn unmap_range(pt: &mut PageTable, va: u64, npages: usize, do_free: bool) {
     assert!(va.is_multiple_of(PAGE), "uvmunmap: not aligned");
-    for i in 0..npages {
-        let a = va + i as u64 * PAGE;
-        if let Some(pa) = pt.take_leaf(a)
-            && do_free
-        {
+    let end = va
+        .checked_add(npages as u64 * PAGE)
+        .expect("uvmunmap: range overflow");
+    let mut next = va;
+    while let Some((mapped, pa)) = pt.take_next_leaf(next, end) {
+        if do_free {
             drop(PhysFrame::from_raw(pa));
         }
+        next = mapped + PAGE;
     }
 }
+
+/// Allocate and map one zero-filled page for a valid lazy user address
+/// (`vmfault`, vm.c:459-478).
+pub fn fault(pt: &mut PageTable, process_size: u64, va: u64, _read: bool) -> Option<PhysAddr> {
+    if va >= process_size {
+        return None;
+    }
+    let va = va & !(PAGE - 1);
+    if pt.leaf_pte(va).is_some() {
+        return None;
+    }
+    let frame = kalloc::alloc()?;
+    let pa = frame.addr();
+    zero_page(pa);
+    pt.map_range(VirtAddr(va), pa, PAGE, Perm::R | Perm::W | Perm::U)
+        .ok()?;
+    frame.leak();
+    Some(pa)
+}
+
+fn resolve(pt: &mut PageTable, process_size: u64, va: u64, read: bool) -> Result<PhysAddr, Err> {
+    walkaddr(pt, va)
+        .or_else(|| fault(pt, process_size, va, read))
+        .ok_or(Err::BadArg)
+}
+
 /// Look up a user virtual address, returning the physical address
 /// (`walkaddr`, vm.c:122-139): requires a valid, user-accessible leaf.
 pub fn walkaddr(pt: &PageTable, va: u64) -> Option<PhysAddr> {
@@ -142,21 +171,21 @@ pub fn clear(pt: &mut PageTable, va: u64) {
     pt.clear_user(va);
 }
 
-/// Copy from user to kernel (`copyin`, vm.c:383-405 minus this
-/// reference's `vmfault` fallback, which belongs to the lazy-sbrk
-/// machinery that joins with the usertests milestone): page-chunked,
-/// `walkaddr`-validated. Unmapped user memory fails.
-pub fn copy_in(pt: &PageTable, dst: &mut [u8], mut srcva: u64) -> Result<(), Err> {
+/// Copy from user to kernel (`copyin`, vm.c:383-405), faulting in valid
+/// lazily-grown pages on demand.
+pub fn copy_in(
+    pt: &mut PageTable,
+    process_size: u64,
+    dst: &mut [u8],
+    mut srcva: u64,
+) -> Result<(), Err> {
     let mut dst = dst;
     while !dst.is_empty() {
         let va0 = srcva & !(PAGE - 1);
-        let pa0 = walkaddr(pt, va0).ok_or(Err::BadArg)?;
+        let pa0 = resolve(pt, process_size, va0, true)?;
         let n = ((PAGE - (srcva - va0)) as usize).min(dst.len());
-        // SAFETY: `pa0` came from the user page table's leaf PTE, so the
-        // page is mapped user-accessible and pinned by the table; the
-        // kernel's identity map makes the physical range addressable
-        // here. No alias exists because kernel buffers are never mapped
-        // into user space.
+        // SAFETY: `pa0` came from a user page-table leaf or `fault`, so
+        // the page is mapped and pinned; the kernel identity map covers it.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 (pa0.0 + srcva - va0) as usize as *const u8,
@@ -170,26 +199,31 @@ pub fn copy_in(pt: &PageTable, dst: &mut [u8], mut srcva: u64) -> Result<(), Err
     Ok(())
 }
 /// Copy a nul-terminated string from user memory (`copyinstr`,
-/// vm.c:410-452). Returns the byte count including the terminating nul.
-/// Fails if no nul appears before `dst` is full or a page is unmapped.
-pub fn copy_instr(pt: &PageTable, dst: &mut [u8], mut srcva: u64) -> Result<usize, Err> {
+/// vm.c:410-452), faulting in valid lazily-grown pages. Returns the byte
+/// count including the terminating nul.
+pub fn copy_instr(
+    pt: &mut PageTable,
+    process_size: u64,
+    dst: &mut [u8],
+    mut srcva: u64,
+) -> Result<usize, Err> {
     let mut copied = 0;
     while copied < dst.len() {
         let va0 = srcva & !(PAGE - 1);
-        let pa0 = walkaddr(pt, va0).ok_or(Err::BadArg)?;
+        let pa0 = resolve(pt, process_size, va0, true)?;
         let mut n = ((PAGE - (srcva - va0)) as usize).min(dst.len() - copied);
         let mut src = (pa0.0 + srcva - va0) as usize as *const u8;
         while n > 0 {
-            // SAFETY: `pa0` is a user-accessible mapped page pinned by
-            // `pt`; the loop stays within that page.
+            // SAFETY: `pa0` is a mapped page pinned by `pt`; the loop
+            // remains within that page.
             let byte = unsafe { src.read() };
             dst[copied] = byte;
             copied += 1;
             if byte == 0 {
                 return Ok(copied);
             }
-            // SAFETY: advancing a raw pointer within the validated page
-            // does not dereference it.
+            // SAFETY: advancing within the validated page does not
+            // dereference the resulting pointer.
             src = unsafe { src.add(1) };
             n -= 1;
         }
@@ -198,25 +232,27 @@ pub fn copy_instr(pt: &PageTable, dst: &mut [u8], mut srcva: u64) -> Result<usiz
     Err(Err::BadArg)
 }
 
-/// Copy from kernel to user (`copyout`, vm.c:345-377): page-chunked,
-/// `walkaddr`-validated, and — as in C — refusing to write over
-/// read-only user pages (vm.c:366-368), which is how exec's text
-/// protection and the copyout fstat-address tests behave.
-pub fn copy_out(pt: &PageTable, mut dstva: u64, mut src: &[u8]) -> Result<(), Err> {
+/// Copy from kernel to user (`copyout`, vm.c:345-377), faulting in valid
+/// lazily-grown pages while still rejecting read-only mappings.
+pub fn copy_out(
+    pt: &mut PageTable,
+    process_size: u64,
+    mut dstva: u64,
+    mut src: &[u8],
+) -> Result<(), Err> {
     while !src.is_empty() {
         let va0 = dstva & !(PAGE - 1);
         if va0 >= crate::arch::riscv64::vm::MAXVA {
             return Err(Err::BadArg);
         }
-        let pa0 = walkaddr(pt, va0).ok_or(Err::BadArg)?;
-        // forbid copyout over read-only user text pages.
+        let pa0 = resolve(pt, process_size, va0, false)?;
         let pte = pt.leaf_pte(va0).ok_or(Err::BadArg)?;
         if !crate::arch::riscv64::vm::pte_writable(pte) {
             return Err(Err::BadArg);
         }
         let n = ((PAGE - (dstva - va0)) as usize).min(src.len());
-        // SAFETY: as `copy_in` — a user page validated by `walkaddr`,
-        // reached through the kernel identity map, with no kernel alias.
+        // SAFETY: `pa0` identifies a writable user page pinned by `pt`
+        // and reached through the kernel identity map.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 src.as_ptr(),

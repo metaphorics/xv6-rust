@@ -5,6 +5,7 @@
 use crate::arch;
 use crate::arch::riscv64::{self, intr, kernelvec};
 use crate::dev::uart16550;
+use crate::mm::uvm;
 use crate::proc::{self, CurrentProc};
 use crate::sync::SpinLock;
 use crate::syscall;
@@ -73,11 +74,16 @@ pub extern "C" fn usertrap() -> u64 {
         syscall::dispatch(&p);
     } else {
         which_dev = devintr();
-        if which_dev == 0 {
-            // This reference handles page faults from lazy sbrk here
-            // (trap.c:70-72, vmfault); until the usertests milestone
-            // ports that machinery, every fault is fatal exactly as
-            // upstream xv6-riscv treats it.
+        let faulted = which_dev == 0
+            && matches!(scause, 13 | 15)
+            && uvm::fault(
+                p.pagetable_mut(),
+                p.sz(),
+                riscv64::r_stval() as u64,
+                scause == 13,
+            )
+            .is_some();
+        if which_dev == 0 && !faulted {
             println!(
                 "usertrap(): unexpected scause {:#x} pid={}",
                 scause,

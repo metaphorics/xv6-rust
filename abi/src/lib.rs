@@ -113,6 +113,11 @@ impl TryFrom<u64> for Sys {
         }
     }
 }
+/// Allocation modes for the two-argument `sbrk` syscall (`kernel/vm.h`).
+pub mod sbrk {
+    pub const EAGER: usize = 1;
+    pub const LAZY: usize = 2;
+}
 
 /// Open flags shared by kernel and userland (`kernel/fcntl.h`).
 pub mod fcntl {

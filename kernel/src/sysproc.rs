@@ -1,5 +1,8 @@
 //! Process system calls (`kernel/sysproc.c`).
 
+use abi::sbrk::EAGER as SBRK_EAGER;
+
+use crate::arch::TRAPFRAME;
 use crate::err::Err;
 use crate::proc::{self, CurrentProc};
 use crate::syscall::{arg_addr, arg_int};
@@ -35,15 +38,22 @@ pub fn getpid(p: &CurrentProc) -> Result<usize, Err> {
     Ok(p.pid() as usize)
 }
 
-/// `sys_sbrk` (sysproc.c:39-65): grow (or shrink) the caller's memory
-/// by `n` bytes, returning the old break. Upstream xv6's eager form:
-/// this reference's lazy variant (grow the size, fault pages in later)
-/// needs the `vmfault` machinery that joins with the usertests port,
-/// so until then every growth is real memory and every fault is fatal.
+/// `sys_sbrk` (sysproc.c:39-65): grow or shrink memory and return the old
+/// break. Eager growth allocates immediately; lazy growth only advances
+/// `p->sz`, and faults or copy helpers allocate pages when first touched.
 pub fn sbrk(p: &CurrentProc) -> Result<usize, Err> {
-    let n = arg_int(p, 0) as i64;
+    let n = arg_int(p, 0);
+    let mode = arg_int(p, 1);
     let addr = p.sz();
-    proc::grow(n)?;
+    if mode == SBRK_EAGER as i32 || n < 0 {
+        proc::grow(n as i64)?;
+    } else {
+        let new_size = addr.checked_add(n as u64).ok_or(Err::TooBig)?;
+        if new_size > TRAPFRAME.0 {
+            return Err(Err::TooBig);
+        }
+        p.set_sz(new_size);
+    }
     Ok(addr as usize)
 }
 
