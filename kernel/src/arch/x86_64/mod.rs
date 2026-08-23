@@ -9,6 +9,11 @@ pub mod trapframe;
 pub mod traps;
 pub mod vm;
 
+use crate::mm::addr::PhysAddr;
+
+pub const KERNBASE: PhysAddr = PhysAddr(0x0010_0000);
+pub const PHYSTOP: PhysAddr = PhysAddr(0x0800_0000);
+
 use core::arch::asm;
 use core::sync::atomic::{AtomicU32, Ordering};
 

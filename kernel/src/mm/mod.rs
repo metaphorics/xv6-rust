@@ -4,8 +4,6 @@
 pub mod addr;
 pub mod frame;
 pub mod kalloc;
-pub mod kernel_map;
-pub mod layout;
 pub mod uvm;
 
 /// Boot smoke test: one allocate / print / free round trip through the

@@ -7,6 +7,16 @@ pub mod start;
 pub mod swtch;
 pub mod trampoline;
 pub mod trapframe;
+pub mod virtio;
+
+use crate::mm::addr::PhysAddr;
+
+pub(super) const UART0: PhysAddr = PhysAddr(0x1000_0000);
+pub(super) const VIRTIO0: PhysAddr = PhysAddr(0x1000_1000);
+pub(super) const PLIC: PhysAddr = PhysAddr(0x0c00_0000);
+pub(super) const PLIC_SIZE: u64 = 0x0400_0000;
+pub const KERNBASE: PhysAddr = PhysAddr(0x8000_0000);
+pub const PHYSTOP: PhysAddr = PhysAddr(0x8800_0000);
 pub mod vm;
 use core::arch::asm;
 

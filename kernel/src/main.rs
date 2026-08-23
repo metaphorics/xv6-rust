@@ -36,11 +36,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// (`__atomic_store_n(&started, 1, __ATOMIC_RELEASE)`, main.c:33).
 static BOOT_RELEASE: AtomicBool = AtomicBool::new(false);
 
-#[cfg(target_arch = "riscv64")]
-use crate::arch::riscv64::intr;
-#[cfg(target_arch = "x86_64")]
-use crate::arch::x86_64::intr;
-
 /// Supervisor-mode entry, the `mret` target of `start`, with the hart id
 /// in `a0`.
 extern "C" fn main(hartid: usize) -> ! {
@@ -49,10 +44,10 @@ extern "C" fn main(hartid: usize) -> ! {
             core::hint::spin_loop();
         }
         // APs leave their temporary climb tables only after the BSP publishes the kernel root.
-        mm::kernel_map::activate_hart();
+        arch::activate_kernel_table();
 
         trap::init_hart();
-        intr::init_hart(hartid);
+        arch::init_interrupt_controller_hart(hartid);
         println!("hart {} running", hartid);
         arch::intr_on();
         proc::scheduler();
@@ -63,12 +58,12 @@ extern "C" fn main(hartid: usize) -> ! {
     println!("xv6-rust kernel is booting"); // main.c:17
     println!();
     mm::kalloc::init(); // physical page allocator (main.c:19)
-    mm::kernel_map::init(); // create kernel page table (main.c:20)
-    mm::kernel_map::activate_hart(); // turn on paging (main.c:21)
+    arch::init_kernel_table(); // create kernel page table (main.c:20)
+    arch::activate_kernel_table(); // turn on paging (main.c:21)
     mm::selftest();
     trap::init_hart(); // install kernel trap vector (main.c:24)
-    intr::init(); // set up interrupt controller (main.c:25)
-    intr::init_hart(0); // ask PLIC for device interrupts (main.c:26)
+    arch::init_interrupt_controller(); // set up interrupt controller (main.c:25)
+    arch::init_interrupt_controller_hart(0); // ask controller for device interrupts (main.c:26)
     arch::start_other_cpus();
     dev::virtio::blk::init(); // emulated hard disk (main.c:30)
     proc::user_init(); // first user process (main.c:30)

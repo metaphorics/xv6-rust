@@ -1,6 +1,6 @@
 //! Virtio-MMIO v2 transport for QEMU's `virt` block device.
 
-use crate::mm::layout::VIRTIO0;
+use super::VIRTIO0;
 
 const BASE: usize = VIRTIO0.0 as usize;
 

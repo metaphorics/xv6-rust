@@ -4,8 +4,7 @@
 
 use super::addr::{PhysAddr, page_round_up};
 use super::frame::PhysFrame;
-use super::layout::PHYSTOP;
-use crate::arch::PAGE_SIZE;
+use crate::arch::{PAGE_SIZE, PHYSTOP};
 use crate::sync::SpinLock;
 
 unsafe extern "C" {

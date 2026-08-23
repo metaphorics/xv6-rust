@@ -3,7 +3,7 @@
 //! Registers are 32-bit MMIO in the PLIC window the kernel page table
 //! identity-maps (`vm.c:36`).
 
-use crate::mm::layout::PLIC;
+use super::PLIC;
 
 /// PLIC MMIO base as a flat address (`PLIC`, memlayout.h:33), mapped
 /// identity into the kernel address space (vm.c:36).

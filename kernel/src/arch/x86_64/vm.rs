@@ -7,7 +7,7 @@ use crate::arch::{KSTACK_PAGES, PAGE_SIZE};
 use crate::mm::addr::{PhysAddr, VirtAddr, px};
 use crate::mm::frame::PhysFrame;
 use crate::mm::kalloc;
-use crate::params::NCPU;
+use crate::params::{NCPU, NPROC};
 
 const PTE_P: u64 = 1 << 0;
 const PTE_W: u64 = 1 << 1;
@@ -16,6 +16,7 @@ const PTE_PS: u64 = 1 << 7;
 const PTE_X_MARK: u64 = 1 << 9;
 const PTE_NX: u64 = 1 << 63;
 const PTE_ADDR: u64 = 0x000f_ffff_ffff_f000;
+static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
 const HUGE_SIZE: u64 = 2 * 1024 * 1024;
 
 pub const MAXVA: u64 = 1 << 38;
@@ -314,7 +315,7 @@ unsafe extern "C" {
 
 fn map_kernel_identity(pt: &mut PageTable) -> Result<(), ()> {
     // SAFETY: linker symbols are used only for their numeric addresses.
-    let start = crate::mm::layout::KERNBASE.0;
+    let start = super::KERNBASE.0;
     let text_end = (&raw const etext) as u64;
     pt.map_range(
         VirtAddr(start),
@@ -350,7 +351,7 @@ fn map_cpu_tables(pt: &mut PageTable) -> Result<(), ()> {
     Ok(())
 }
 
-pub fn map_kernel(pt: &mut PageTable) {
+fn map_kernel(pt: &mut PageTable) {
     map_kernel_identity(pt).expect("x86 kernel map");
     pt.map_range(
         VirtAddr(super::boot::AP_BOOT_ADDR as u64),
@@ -380,9 +381,44 @@ unsafe extern "C" {
     static X86_KERNEL_CR3: AtomicU64;
 }
 
-pub fn set_kernel_root(root: PhysAddr) {
+fn set_kernel_root(root: PhysAddr) {
     // SAFETY: the trampoline owns this atomic word and the BSP publishes it once.
     unsafe { X86_KERNEL_CR3.store(root.0, Ordering::Release) };
+}
+
+/// Build and publish the shared x86_64 kernel page table.
+pub fn init_kernel_table() {
+    let mut pt = PageTable::new().expect("kvmmake: no page for root");
+    map_kernel(&mut pt);
+    pt.map_range(
+        TRAMPOLINE,
+        PhysAddr(trampoline_addr()),
+        PAGE_SIZE as u64,
+        Perm::R | Perm::X,
+    )
+    .expect("trampoline map");
+    for slot in 0..NPROC {
+        for stack_page in 0..KSTACK_PAGES {
+            let frame = kalloc::alloc().expect("proc_mapstacks: kalloc");
+            pt.map_range(
+                VirtAddr(kstack(slot).0 + stack_page as u64 * PAGE_SIZE as u64),
+                frame.leak(),
+                PAGE_SIZE as u64,
+                Perm::R | Perm::W,
+            )
+            .expect("kernel stack map");
+        }
+    }
+    let root = pt.leak_root();
+    set_kernel_root(root);
+    KERNEL_ROOT.store(root.0, Ordering::Release);
+}
+
+/// Activate the published kernel table on this hart.
+pub fn activate_kernel_table() {
+    let root = KERNEL_ROOT.load(Ordering::Acquire);
+    assert!(root != 0, "kvminithart before kvminit");
+    activate(PhysAddr(root));
 }
 
 pub fn prepare_user_table(pt: &mut PageTable, slot: usize) -> Result<(), ()> {

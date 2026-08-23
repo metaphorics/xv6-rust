@@ -2,8 +2,7 @@
 
 use super::addr::PhysAddr;
 use super::kalloc;
-use super::layout::PHYSTOP;
-use crate::arch::PAGE_SIZE;
+use crate::arch::{PAGE_SIZE, PHYSTOP};
 
 /// An owned, non-copyable 4 KiB physical page — the `void *` that
 /// `kalloc` returns (kalloc.c:71-85). Dropping returns the page to the

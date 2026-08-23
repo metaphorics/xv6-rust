@@ -5,11 +5,22 @@
 //! and `MAXVA` bounds the translatable half (riscv.h:389-417, vm.c:99-105).
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use super::{KERNBASE, PHYSTOP, PLIC, PLIC_SIZE, UART0, VIRTIO0};
 
 use crate::arch::{KSTACK_PAGES, PAGE_SIZE};
 use crate::mm::addr::{PhysAddr, VirtAddr, px};
 use crate::mm::frame::PhysFrame;
 use crate::mm::kalloc;
+use crate::params::NPROC;
+
+static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
+
+unsafe extern "C" {
+    /// End of kernel text, provided by the linker script.
+    static etext: u8;
+}
 
 // PTE permission bits (riscv.h:395-399).
 const PTE_V: u64 = 1 << 0;
@@ -263,6 +274,77 @@ pub fn activate(root: PhysAddr) {
         asm!("csrw satp, {satp}", satp = in(reg) satp, options(nostack));
         asm!("sfence.vma zero, zero");
     }
+}
+
+/// Build and publish the shared Sv39 kernel page table.
+pub fn init_kernel_table() {
+    let mut pt = PageTable::new().expect("kvmmake: no page for root");
+    let page = PAGE_SIZE as u64;
+
+    map_kernel(&mut pt, VirtAddr(UART0.0), UART0, page, Perm::R | Perm::W);
+    map_kernel(
+        &mut pt,
+        VirtAddr(VIRTIO0.0),
+        VIRTIO0,
+        page,
+        Perm::R | Perm::W,
+    );
+    map_kernel(
+        &mut pt,
+        VirtAddr(PLIC.0),
+        PLIC,
+        PLIC_SIZE,
+        Perm::R | Perm::W,
+    );
+
+    // SAFETY: `etext` is a linker symbol used only for its address.
+    let etext_pa = PhysAddr((&raw const etext) as u64);
+    map_kernel(
+        &mut pt,
+        VirtAddr(KERNBASE.0),
+        KERNBASE,
+        etext_pa.0 - KERNBASE.0,
+        Perm::R | Perm::X,
+    );
+    map_kernel(
+        &mut pt,
+        VirtAddr(etext_pa.0),
+        etext_pa,
+        PHYSTOP.0 - etext_pa.0,
+        Perm::R | Perm::W,
+    );
+    map_kernel(
+        &mut pt,
+        TRAMPOLINE,
+        PhysAddr(trampoline_addr()),
+        page,
+        Perm::R | Perm::X,
+    );
+    for slot in 0..NPROC {
+        for stack_page in 0..KSTACK_PAGES {
+            let frame = kalloc::alloc().expect("proc_mapstacks: kalloc");
+            map_kernel(
+                &mut pt,
+                VirtAddr(kstack(slot).0 + stack_page as u64 * page),
+                frame.leak(),
+                page,
+                Perm::R | Perm::W,
+            );
+        }
+    }
+
+    KERNEL_ROOT.store(pt.leak_root().0, Ordering::Release);
+}
+
+/// Activate the published kernel table on this hart.
+pub fn activate_kernel_table() {
+    let root = KERNEL_ROOT.load(Ordering::Acquire);
+    assert!(root != 0, "kvminithart before kvminit");
+    activate(PhysAddr(root));
+}
+
+fn map_kernel(pt: &mut PageTable, va: VirtAddr, pa: PhysAddr, size: u64, perm: Perm) {
+    pt.map_range(va, pa, size, perm).expect("kvmmap");
 }
 
 /// Return the leaf PTE slot for `va` (`walk`, vm.c:99-120): descend
