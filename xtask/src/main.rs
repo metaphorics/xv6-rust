@@ -45,8 +45,23 @@ fn main() {
             let arch = parse_arch(&rest, program.as_deref());
             run(&arch, rest.iter().any(|arg| arg == "--echo-test"));
         }
+        Some("test") => {
+            let rest: Vec<String> = args.collect();
+            let (arch, test) = parse_test_args(&rest, program.as_deref());
+            test_xv6(&arch, test);
+        }
         _ => usage(program.as_deref()),
     }
+}
+
+#[derive(Clone, Copy)]
+enum TestKind {
+    Quick,
+    Full,
+    Crash,
+    Log,
+    Forphan,
+    Dorphan,
 }
 
 fn parse_arch(args: &[String], program: Option<&str>) -> String {
@@ -58,6 +73,32 @@ fn parse_arch(args: &[String], program: Option<&str>) -> String {
     let name = program.unwrap_or("cargo xtask");
     eprintln!("{name}: run expects --arch <riscv64>");
     std::process::exit(2);
+}
+
+fn parse_test_args(args: &[String], program: Option<&str>) -> (String, TestKind) {
+    let arch = parse_arch(args, program);
+    let mut test = None;
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--arch" {
+            index += 2;
+            continue;
+        }
+        if test.is_some() || args[index].starts_with('-') {
+            usage(program);
+        }
+        test = Some(match args[index].as_str() {
+            "quick" => TestKind::Quick,
+            "full" => TestKind::Full,
+            "crash" => TestKind::Crash,
+            "log" => TestKind::Log,
+            "forphan" => TestKind::Forphan,
+            "dorphan" => TestKind::Dorphan,
+            _ => usage(program),
+        });
+        index += 1;
+    }
+    (arch, test.unwrap_or(TestKind::Full))
 }
 
 fn check() {
@@ -111,13 +152,10 @@ fn check() {
 }
 
 fn run(arch: &str, echo_test: bool) {
-    if arch != "riscv64" {
-        eprintln!("xtask: only riscv64 is implemented");
-        std::process::exit(1);
-    }
+    require_riscv64(arch);
     let root = workspace_root();
     let kernel = build_kernel(root);
-    let programs = build_user_programs(root);
+    let programs = build_user_programs(root, &[]);
     let image = build_fs_image(root, &programs);
     let qemu = require_qemu();
     let image_files = programs.len() + 1;
@@ -125,6 +163,124 @@ fn run(arch: &str, echo_test: bool) {
         boot_echo_test(qemu, &kernel, &image);
     } else {
         boot_shell_smoke(qemu, &kernel, &image, image_files);
+    }
+}
+
+fn test_xv6(arch: &str, test: TestKind) {
+    require_riscv64(arch);
+    let root = workspace_root();
+    let extra_programs: &[&str] = match test {
+        TestKind::Quick | TestKind::Full => &["usertests"],
+        _ => &[],
+    };
+    let harness = TestHarness {
+        root,
+        kernel: build_kernel(root),
+        programs: build_user_programs(root, extra_programs),
+        qemu: require_qemu(),
+    };
+    match test {
+        TestKind::Quick | TestKind::Full => harness.usertests(test),
+        TestKind::Crash => {
+            harness.log();
+            harness.forphan();
+            harness.dorphan();
+            println!("XTASK: crash recovery tests ok");
+        }
+        TestKind::Log => harness.log(),
+        TestKind::Forphan => harness.forphan(),
+        TestKind::Dorphan => harness.dorphan(),
+    }
+}
+
+fn require_riscv64(arch: &str) {
+    if arch != "riscv64" {
+        fail("only riscv64 is implemented");
+    }
+}
+
+struct TestHarness {
+    root: &'static Path,
+    kernel: PathBuf,
+    programs: Vec<PathBuf>,
+    qemu: &'static str,
+}
+
+impl TestHarness {
+    fn fresh_image(&self) -> PathBuf {
+        build_fs_image(self.root, &self.programs)
+    }
+
+    fn usertests(&self, test: TestKind) {
+        let image = self.fresh_image();
+        let (command, timeout) = match test {
+            TestKind::Quick => (b"usertests -q\n".as_slice(), Duration::from_secs(300)),
+            TestKind::Full => (b"usertests\n".as_slice(), Duration::from_secs(600)),
+            _ => fail("internal error: invalid usertests mode"),
+        };
+        let (mut child, mut console) = spawn_qemu(self.qemu, &self.kernel, &image);
+        send_after_prompt(&mut child, &mut console, command);
+        let matched = console.wait_for_any(
+            &mut child,
+            &[b"ALL TESTS PASSED", b"FAILED", b"exec usertests failed"],
+            timeout,
+        );
+        if matched != 0 {
+            kill(&mut child);
+            fail("usertests reported a failure");
+        }
+        kill(&mut child);
+        println!("XTASK: usertests passed");
+    }
+
+    fn log(&self) {
+        println!("==> log crash recovery");
+        for attempt in 1..=5 {
+            let image = self.fresh_image();
+            let (mut child, mut console) = spawn_qemu(self.qemu, &self.kernel, &image);
+            send_after_prompt(&mut child, &mut console, b"logstress f0 f1 f2 f3 f4 f5\n");
+            thread::sleep(Duration::from_secs(2));
+            kill(&mut child);
+
+            let (mut child, mut console) = spawn_qemu(self.qemu, &self.kernel, &image);
+            let recovered = console.wait_for_any(
+                &mut child,
+                &[b"recovering tail ", b"init: starting sh"],
+                TIMEOUT,
+            ) == 0;
+            if recovered {
+                send_after_prompt(&mut child, &mut console, b"ls\n");
+                console.wait_for(&mut child, b"\nf5 ");
+                kill(&mut child);
+                println!("XTASK: log recovery ok (attempt {attempt})");
+                return;
+            }
+            kill(&mut child);
+            println!("==> log attempt {attempt} did not leave a committed transaction");
+        }
+        fail("log recovery did not trigger in 5 attempts");
+    }
+
+    fn forphan(&self) {
+        self.orphan(b"forphan\n", "forphan");
+    }
+
+    fn dorphan(&self) {
+        self.orphan(b"dorphan\n", "dorphan");
+    }
+
+    fn orphan(&self, command: &[u8], name: &str) {
+        println!("==> {name} crash recovery");
+        let image = self.fresh_image();
+        let (mut child, mut console) = spawn_qemu(self.qemu, &self.kernel, &image);
+        send_after_prompt(&mut child, &mut console, command);
+        console.wait_for(&mut child, b"wait for kill and reclaim");
+        kill(&mut child);
+
+        let (mut child, mut console) = spawn_qemu(self.qemu, &self.kernel, &image);
+        console.wait_for(&mut child, b"ireclaim: orphaned inode ");
+        kill(&mut child);
+        println!("XTASK: {name} recovery ok");
     }
 }
 
@@ -142,18 +298,22 @@ fn build_kernel(root: &Path) -> PathBuf {
         .unwrap_or_else(|| fail("cargo did not report a kernel executable"))
 }
 
-fn build_user_programs(root: &Path) -> Vec<PathBuf> {
-    println!("==> cargo build --release --bins, user");
-    let executables = cargo_executables(
-        Command::new("cargo").current_dir(root.join("user")).args([
-            "build",
-            "--release",
-            "--bins",
-            "--message-format=json",
-        ]),
-        "user build",
-    );
-    USER_PROGRAMS
+fn build_user_programs(root: &Path, extra: &[&str]) -> Vec<PathBuf> {
+    let names: Vec<&str> = USER_PROGRAMS
+        .iter()
+        .copied()
+        .chain(extra.iter().copied())
+        .collect();
+    println!("==> cargo build --release, user programs");
+    let mut command = Command::new("cargo");
+    command
+        .current_dir(root.join("user"))
+        .args(["build", "--release", "--message-format=json"]);
+    for name in &names {
+        command.arg("--bin").arg(name);
+    }
+    let executables = cargo_executables(&mut command, "user build");
+    names
         .iter()
         .map(|name| {
             let source = executables
@@ -250,21 +410,33 @@ struct Console {
 
 impl Console {
     fn wait_for(&mut self, child: &mut Child, expected: &[u8]) {
-        let deadline = Instant::now() + TIMEOUT;
+        let _ = self.wait_for_any(child, &[expected], TIMEOUT);
+    }
+
+    fn wait_for_any(&mut self, child: &mut Child, expected: &[&[u8]], timeout: Duration) -> usize {
+        let deadline = Instant::now() + timeout;
         loop {
-            if let Some(at) = find_bytes(&self.pending, expected) {
-                self.pending.drain(..at + expected.len());
-                return;
+            if let Some((index, at)) = expected
+                .iter()
+                .enumerate()
+                .filter_map(|(index, marker)| {
+                    find_bytes(&self.pending, marker).map(|at| (index, at))
+                })
+                .min_by_key(|(_, at)| *at)
+            {
+                self.pending.drain(..at + expected[index].len());
+                return index;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             match self.rx.recv_timeout(remaining) {
                 Ok(chunk) => self.pending.extend_from_slice(&chunk),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     kill(child);
-                    fail(&format!(
-                        "timed out waiting for {:?}",
-                        String::from_utf8_lossy(expected)
-                    ));
+                    let markers: Vec<_> = expected
+                        .iter()
+                        .map(|marker| String::from_utf8_lossy(marker))
+                        .collect();
+                    fail(&format!("timed out waiting for one of {markers:?}"));
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     kill(child);
@@ -435,6 +607,7 @@ fn usage(program: Option<&str>) -> ! {
     let name = program.unwrap_or("cargo xtask");
     eprintln!("usage: {name} check");
     eprintln!("       {name} run --arch riscv64 [--echo-test]");
+    eprintln!("       {name} test --arch riscv64 [quick|full|crash|log|forphan|dorphan]");
     std::process::exit(2)
 }
 
