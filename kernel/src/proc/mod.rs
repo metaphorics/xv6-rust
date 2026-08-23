@@ -214,6 +214,10 @@ impl core::ops::DerefMut for PrivateGuard<'_> {
 
 impl Drop for PrivateGuard<'_> {
     fn drop(&mut self) {
+        // Normal unwinds and context-switch paths drop the guard before
+        // execution continues elsewhere. The kernel uses panic=abort, so a
+        // panic runs no destructors and has no post-panic execution that
+        // could observe the borrow bit still set.
         assert!(
             self.proc.private_borrowed.swap(false, Ordering::Release),
             "current process private borrow was not held"
@@ -452,7 +456,8 @@ fn as_str(bytes: &[u8]) -> &str {
 /// # Safety
 ///
 /// Caller must hold the slot's `private_borrowed` guard, or hold the
-/// slot's `shared` lock while the process is not running (alloc/free/fork).
+/// slot's `shared` lock and prove its state is not `Running`. A shared
+/// lock alone never permits access to a running process's private fields.
 unsafe fn private(p: &Proc) -> &ProcPrivate {
     // SAFETY: caller contract above.
     unsafe { &*private_ptr(p) }
@@ -1008,10 +1013,10 @@ extern "C" fn forkret() {
 }
 
 /// Print a process listing (`procdump`, proc.c:671-701) — the ^P
-/// handler. The state is read under each slot's lock (C reads
-/// lock-free to keep a wedged machine dumpable; the safe read below
-/// matches on every healthy machine, and a wedged one has no console
-/// left to help).
+/// handler. Each slot's shared fields are read under its lock. Private
+/// fields are read only when that state proves the process is not running;
+/// a running process gets a fixed marker instead, because its private
+/// fields may be changing without the shared lock.
 pub fn procdump() {
     println!();
     for proc in &PROCS {
@@ -1027,9 +1032,12 @@ pub fn procdump() {
             ProcState::Running => "run   ",
             ProcState::Zombie => "zombie",
         };
-        // SAFETY: diagnostic read of bytes that only fork/alloc write
-        // under the shared lock we hold; a torn value is garbage text,
-        // never invalid memory.
+        if shared.state == ProcState::Running {
+            println!("{} {} <running>", shared.pid, state);
+            continue;
+        }
+        // SAFETY: the shared lock is held and the state was proved not to
+        // be Running, so no running process can mutate its private fields.
         let name = unsafe { private(proc) }.name;
         let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
         println!("{} {} {}", shared.pid, state, as_str(&name[..end]));
