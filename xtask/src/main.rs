@@ -11,7 +11,27 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
-const USER_PROGRAMS: [&str; 5] = ["init", "sh", "echo", "ls", "cat"];
+const USER_PROGRAMS: [&str; 19] = [
+    "init",
+    "sh",
+    "echo",
+    "ls",
+    "cat",
+    "grep",
+    "kill",
+    "ln",
+    "mkdir",
+    "rm",
+    "wc",
+    "zombie",
+    "stressfs",
+    "sync",
+    "logstress",
+    "forphan",
+    "dorphan",
+    "grind",
+    "forktest",
+];
 const README_FIRST_LINE: &str =
     "xv6 is a re-implementation of Dennis Ritchie's and Ken Thompson's Unix";
 
@@ -100,10 +120,11 @@ fn run(arch: &str, echo_test: bool) {
     let programs = build_user_programs(root);
     let image = build_fs_image(root, &programs);
     let qemu = require_qemu();
+    let image_files = programs.len() + 1;
     if echo_test {
         boot_echo_test(qemu, &kernel, &image);
     } else {
-        boot_shell_smoke(qemu, &kernel, &image);
+        boot_shell_smoke(qemu, &kernel, &image, image_files);
     }
 }
 
@@ -318,7 +339,7 @@ fn boot_echo_test(qemu: &str, kernel: &Path, image: &Path) -> ! {
     std::process::exit(0)
 }
 
-fn boot_shell_smoke(qemu: &str, kernel: &Path, image: &Path) -> ! {
+fn boot_shell_smoke(qemu: &str, kernel: &Path, image: &Path, image_files: usize) -> ! {
     let (mut child, mut console) = spawn_qemu(qemu, kernel, image);
     console.wait_for(&mut child, b"init: starting sh");
     command(&mut child, &mut console, b"echo hi\n", b"hi\n");
@@ -334,9 +355,28 @@ fn boot_shell_smoke(qemu: &str, kernel: &Path, image: &Path) -> ! {
     console.wait_for(&mut child, b"cat README");
     console.wait_for(&mut child, b"\n");
     console.wait_for(&mut child, README_FIRST_LINE.as_bytes());
+
+    send_after_prompt(&mut child, &mut console, b"ls | wc\n");
+    console.wait_for(&mut child, b"ls | wc");
+    console.wait_for(&mut child, b"\n");
+    let expected_entries = format!("{} ", image_files + 3);
+    console.wait_for(&mut child, expected_entries.as_bytes());
+
+    command_done(&mut child, &mut console, b"mkdir d\n");
+    command_done(&mut child, &mut console, b"echo x > d/f\n");
+    command(&mut child, &mut console, b"cat d/f\n", b"x\n");
+    command(
+        &mut child,
+        &mut console,
+        b"rm d\n",
+        b"rm: d failed to delete\n",
+    );
+    command_done(&mut child, &mut console, b"rm d/f\n");
+    command_done(&mut child, &mut console, b"rm d\n");
+    command(&mut child, &mut console, b"ls d\n", b"ls: cannot open d\n");
     console.wait_for(&mut child, b"$ ");
 
-    println!("XTASK: shell smoke ok");
+    println!("XTASK: M7 shell smoke ok");
     kill(&mut child);
     std::process::exit(0)
 }
@@ -346,6 +386,12 @@ fn command(child: &mut Child, console: &mut Console, input: &[u8], output: &[u8]
     console.wait_for(child, &input[..input.len() - 1]);
     console.wait_for(child, b"\n");
     console.wait_for(child, output);
+}
+
+fn command_done(child: &mut Child, console: &mut Console, input: &[u8]) {
+    send_after_prompt(child, console, input);
+    console.wait_for(child, &input[..input.len() - 1]);
+    console.wait_for(child, b"\n");
 }
 
 fn send_after_prompt(child: &mut Child, console: &mut Console, input: &[u8]) {

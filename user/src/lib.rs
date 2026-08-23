@@ -181,6 +181,35 @@ pub fn chdir(path: &[u8]) -> i32 {
     call(abi::Sys::Chdir, path.as_ptr() as usize, 0, 0) as i32
 }
 
+pub fn link(old: &[u8], new: &[u8]) -> i32 {
+    let Some(old) = c_path(old) else { return -1 };
+    let Some(new) = c_path(new) else { return -1 };
+    call(
+        abi::Sys::Link,
+        old.as_ptr() as usize,
+        new.as_ptr() as usize,
+        0,
+    ) as i32
+}
+
+pub fn unlink(path: &[u8]) -> i32 {
+    let Some(path) = c_path(path) else {
+        return -1;
+    };
+    call(abi::Sys::Unlink, path.as_ptr() as usize, 0, 0) as i32
+}
+
+pub fn mkdir(path: &[u8]) -> i32 {
+    let Some(path) = c_path(path) else {
+        return -1;
+    };
+    call(abi::Sys::Mkdir, path.as_ptr() as usize, 0, 0) as i32
+}
+
+pub fn sync() -> i32 {
+    call(abi::Sys::Sync, 0, 0, 0) as i32
+}
+
 pub fn fstat(fd: i32) -> Result<Stat, Error> {
     let mut stat = core::mem::MaybeUninit::<Stat>::uninit();
     if call(abi::Sys::Fstat, fd as usize, stat.as_mut_ptr() as usize, 0) < 0 {
@@ -188,6 +217,16 @@ pub fn fstat(fd: i32) -> Result<Stat, Error> {
     }
     // SAFETY: successful fstat initializes every byte of the ABI Stat.
     Ok(unsafe { stat.assume_init() })
+}
+
+pub fn stat(path: &[u8]) -> Result<Stat, Error> {
+    let fd = open(path, abi::fcntl::O_RDONLY);
+    if fd < 0 {
+        return Err(Error);
+    }
+    let result = fstat(fd);
+    let _ = close(fd);
+    result
 }
 
 pub fn exec(path: &[u8], args: &[&[u8]]) -> isize {
@@ -249,16 +288,30 @@ fn c_path(path: &[u8]) -> Option<[u8; MAXPATH]> {
 }
 
 pub fn atoi(bytes: &[u8]) -> i32 {
-    let mut value = 0i32;
-    for byte in bytes {
+    let bytes = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .map_or(&[][..], |start| &bytes[start..]);
+    let (negative, digits) = match bytes.first() {
+        Some(b'-') => (true, &bytes[1..]),
+        Some(b'+') => (false, &bytes[1..]),
+        _ => (false, bytes),
+    };
+    let mut value = 0i64;
+    for byte in digits {
         if !byte.is_ascii_digit() {
             break;
         }
         value = value
             .saturating_mul(10)
-            .saturating_add(i32::from(*byte - b'0'));
+            .saturating_add(i64::from(*byte - b'0'));
     }
-    value
+    let signed = if negative {
+        value.saturating_neg()
+    } else {
+        value
+    };
+    signed.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
 pub struct Stdout;

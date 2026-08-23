@@ -9,6 +9,7 @@ use super::log;
 use crate::dev::console;
 use crate::err::Err;
 use crate::params::NFILE;
+use crate::pipe::{self, PipeEnd};
 use crate::proc;
 use crate::sync::SpinLock;
 
@@ -25,6 +26,7 @@ struct FileSlot {
 enum FileKind {
     None,
     Device(i16),
+    Pipe(PipeEnd),
     Inode(Inode),
 }
 
@@ -66,6 +68,31 @@ impl FileHandle {
         Some(handle)
     }
 
+    pub fn pipe_pair() -> Option<(Self, Self)> {
+        let (read_end, write_end) = pipe::alloc()?;
+        let Some(read) = alloc() else {
+            read_end.close();
+            write_end.close();
+            return None;
+        };
+        {
+            let mut files = FILES.lock();
+            files[read.index].readable = true;
+            files[read.index].kind = FileKind::Pipe(read_end);
+        }
+        let Some(write) = alloc() else {
+            drop(read);
+            write_end.close();
+            return None;
+        };
+        {
+            let mut files = FILES.lock();
+            files[write.index].writable = true;
+            files[write.index].kind = FileKind::Pipe(write_end);
+        }
+        Some((read, write))
+    }
+
     pub fn read(&self, user_dst: bool, mut dst: u64, n: usize) -> Result<usize, Err> {
         let files = FILES.lock();
         let slot = &files[self.index];
@@ -80,6 +107,11 @@ impl FileHandle {
                     return Err(Err::BadArg);
                 }
                 console::read(user_dst, dst, n)
+            }
+            FileKind::Pipe(pipe) => {
+                let pipe = *pipe;
+                drop(files);
+                pipe.read(user_dst, dst, n)
             }
             FileKind::Inode(inode) => {
                 let inode = inode.clone();
@@ -122,6 +154,11 @@ impl FileHandle {
                     return Err(Err::BadArg);
                 }
                 Ok(console::write(user_src, src, n))
+            }
+            FileKind::Pipe(pipe) => {
+                let pipe = *pipe;
+                drop(files);
+                pipe.write(user_src, src, n)
             }
             FileKind::Inode(inode) => {
                 let inode = inode.clone();
@@ -180,6 +217,7 @@ impl FileHandle {
                 nlink: 1,
                 size: *major as u64,
             }),
+            FileKind::Pipe(_) => Err(Err::BadArg),
             FileKind::None => Err(Err::BadArg),
         }
     }
@@ -218,12 +256,16 @@ impl Drop for FileHandle {
         files[self.index].writable = false;
         drop(files);
 
-        if let FileKind::Inode(inode) = kind {
-            // The final inode reference may reclaim blocks, so fileclose owns
-            // exactly one surrounding transaction as in file.c.
-            let operation = log::begin_op();
-            drop(inode);
-            drop(operation);
+        match kind {
+            FileKind::Inode(inode) => {
+                // The final inode reference may reclaim blocks, so fileclose owns
+                // exactly one surrounding transaction as in file.c.
+                let operation = log::begin_op();
+                drop(inode);
+                drop(operation);
+            }
+            FileKind::Pipe(pipe) => pipe.close(),
+            FileKind::None | FileKind::Device(_) => {}
         }
     }
 }

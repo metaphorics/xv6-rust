@@ -22,6 +22,7 @@ mod exec;
 mod fs;
 mod mm;
 mod params;
+mod pipe;
 mod proc;
 mod sync;
 mod syscall;

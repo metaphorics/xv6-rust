@@ -12,6 +12,7 @@ struct Log {
     size: u32,
     outstanding: u32,
     committing: bool,
+    commits: u64,
     dev: u32,
     header: LogHeader,
 }
@@ -24,6 +25,7 @@ impl Log {
             outstanding: 0,
             committing: false,
             dev: 0,
+            commits: 0,
             header: LogHeader {
                 n: 0,
                 block: [0; LOGBLOCKS],
@@ -42,6 +44,7 @@ pub fn init(dev: u32, sb: Superblock) {
         log.size = sb.nlog;
         log.dev = dev;
         log.outstanding = 0;
+        log.commits = 0;
         log.committing = false;
         log.header = LogHeader::default();
     }
@@ -98,8 +101,21 @@ fn end_op() {
 
     let mut log = LOG.lock();
     log.committing = false;
+    log.commits = log.commits.wrapping_add(1);
     drop(log);
     proc::wakeup(LOG.chan());
+}
+
+/// Wait until all operations active at the call boundary are committed.
+pub fn sync() {
+    let mut log = LOG.lock();
+    if !log.committing && log.outstanding == 0 {
+        return;
+    }
+    let target = log.commits.wrapping_add(1);
+    while log.commits < target {
+        log = proc::sleep(LOG.chan(), log);
+    }
 }
 
 /// Record a dirty buffer in the current transaction (`log_write`).

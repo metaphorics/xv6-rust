@@ -85,8 +85,20 @@ fn child_path(parent: &[u8], name: &[u8]) -> Vec<u8> {
     path
 }
 
-fn print_entry(name: &[u8], kind: i16, ino: u32, size: u64) {
-    ustd::println!("{} {kind} {ino} {size}", display(name));
+fn print_entry(path: &[u8], kind: i16, ino: u32, size: u64) {
+    let name = path
+        .iter()
+        .rposition(|byte| *byte == b'/')
+        .map_or(path, |slash| &path[slash + 1..]);
+    if name.len() >= DIRSIZ {
+        ustd::println!("{} {kind} {ino} {size}", display(name));
+    } else {
+        ustd::println!(
+            "{:<width$} {kind} {ino} {size}",
+            display(name),
+            width = DIRSIZ
+        );
+    }
 }
 
 fn display(bytes: &[u8]) -> &str {

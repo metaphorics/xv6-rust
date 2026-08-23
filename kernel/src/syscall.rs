@@ -17,6 +17,7 @@ pub fn dispatch(p: &CurrentProc) {
     };
 
     let ret: Result<usize, Err> = match sys {
+        Sys::Pipe => sysfile::pipe(p),
         Sys::Fork => sysproc::fork(),
         Sys::Exit => sysproc::exit(p),
         Sys::Wait => sysproc::wait(p),
@@ -27,15 +28,18 @@ pub fn dispatch(p: &CurrentProc) {
         Sys::Uptime => sysproc::uptime(),
         Sys::Exec => sysfile::exec(p),
         Sys::Fstat => sysfile::fstat(p),
+        Sys::Link => sysfile::link(p),
+        Sys::Unlink => sysfile::unlink(p),
+        Sys::Mkdir => sysfile::mkdir(p),
         Sys::Chdir => sysfile::chdir(p),
         Sys::Dup => sysfile::dup(p),
         Sys::Open => sysfile::open(p),
         Sys::Write => sysfile::write(p),
         Sys::Mknod => sysfile::mknod(p),
         Sys::Close => sysfile::close(p),
+        Sys::Sync => sysfile::sync(p),
         Sys::Read => sysfile::read(p),
-        // Pipe and namespace mutation join in M7.
-        _ => Err(Err::BadArg),
+        // Every ABI syscall has a concrete handler by M7.
     };
 
     p.trapframe().set_ret(match ret {

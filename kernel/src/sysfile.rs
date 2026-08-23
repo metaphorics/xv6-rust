@@ -1,7 +1,7 @@
 //! File-system syscall plumbing (`kernel/sysfile.c`).
 
 use abi::fcntl::{O_CREATE, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY};
-use abi::{FileType, Stat};
+use abi::{DIRSIZ, Dirent, FileType, Stat};
 
 use crate::arch::PAGE_SIZE;
 use crate::err::Err;
@@ -137,6 +137,129 @@ pub fn mknod(process: &CurrentProc) -> Result<usize, Err> {
     Ok(0)
 }
 
+pub fn pipe(process: &CurrentProc) -> Result<usize, Err> {
+    let (read, write) = FileHandle::pipe_pair().ok_or(Err::NoMem)?;
+    let read_fd = fd_alloc(process, read)?;
+    let write_fd = match fd_alloc(process, write) {
+        Ok(fd) => fd,
+        Err(err) => {
+            drop(process.replace_file(read_fd, None));
+            return Err(err);
+        }
+    };
+    let mut bytes = [0; 2 * size_of::<i32>()];
+    bytes[..4].copy_from_slice(&(read_fd as i32).to_le_bytes());
+    bytes[4..].copy_from_slice(&(write_fd as i32).to_le_bytes());
+    if let Err(err) = uvm::copy_out(process.pagetable(), arg_addr(process, 0), &bytes) {
+        drop(process.replace_file(read_fd, None));
+        drop(process.replace_file(write_fd, None));
+        return Err(err);
+    }
+    Ok(0)
+}
+
+pub fn link(process: &CurrentProc) -> Result<usize, Err> {
+    let mut old = [0; MAXPATH];
+    let old_len = fetch_str(process, arg_addr(process, 0), &mut old)?;
+    let mut new = [0; MAXPATH];
+    let new_len = fetch_str(process, arg_addr(process, 1), &mut new)?;
+    let operation = log::begin_op();
+    let inode = inode::namei(&old[..old_len - 1]).ok_or(Err::NoEnt)?;
+    {
+        let mut guard = inode.lock();
+        if guard.kind() == FileType::Dir as i16 || guard.nlink() == i16::MAX {
+            return Err(Err::BadArg);
+        }
+        guard.set_nlink(guard.nlink() + 1);
+        guard.update();
+    }
+
+    let linked = if let Some((parent, name)) = inode::nameiparent(&new[..new_len - 1]) {
+        let same_device = parent.dev() == inode.dev();
+        let mut guard = parent.lock();
+        let linked = same_device && guard.dir_link(&name, inode.inum());
+        drop(guard);
+        drop(parent);
+        linked
+    } else {
+        false
+    };
+    if !linked {
+        let mut guard = inode.lock();
+        guard.set_nlink(guard.nlink() - 1);
+        guard.update();
+        return Err(Err::BadArg);
+    }
+    drop(inode);
+    drop(operation);
+    Ok(0)
+}
+
+pub fn unlink(process: &CurrentProc) -> Result<usize, Err> {
+    let mut path = [0; MAXPATH];
+    let path_len = fetch_str(process, arg_addr(process, 0), &mut path)?;
+    let operation = log::begin_op();
+    let (parent, name) = inode::nameiparent(&path[..path_len - 1]).ok_or(Err::NoEnt)?;
+    let mut parent_guard = parent.lock();
+    if dir_name_eq(&name, b".") || dir_name_eq(&name, b"..") {
+        return Err(Err::BadArg);
+    }
+    let mut offset = 0;
+    let child = parent_guard
+        .dir_lookup(&name, Some(&mut offset))
+        .ok_or(Err::NoEnt)?;
+    let mut child_guard = child.lock();
+    assert!(child_guard.nlink() >= 1, "unlink: nlink < 1");
+    if child_guard.kind() == FileType::Dir as i16 {
+        let mut at = (2 * Dirent::ENCODED_LEN) as u32;
+        while at < child_guard.size() {
+            let mut bytes = [0; Dirent::ENCODED_LEN];
+            assert_eq!(
+                child_guard.read_at(&mut bytes, at),
+                bytes.len(),
+                "isdirempty read"
+            );
+            if Dirent::decode(&bytes).expect("dirent encoding").inum != 0 {
+                return Err(Err::BadArg);
+            }
+            at += Dirent::ENCODED_LEN as u32;
+        }
+    }
+
+    assert_eq!(
+        parent_guard.write_at(&Dirent::default().encode(), offset),
+        Dirent::ENCODED_LEN,
+        "unlink write"
+    );
+    if child_guard.kind() == FileType::Dir as i16 {
+        parent_guard.set_nlink(parent_guard.nlink() - 1);
+        parent_guard.update();
+    }
+    drop(parent_guard);
+    drop(parent);
+    child_guard.set_nlink(child_guard.nlink() - 1);
+    child_guard.update();
+    drop(child_guard);
+    drop(child);
+    drop(operation);
+    Ok(0)
+}
+
+pub fn mkdir(process: &CurrentProc) -> Result<usize, Err> {
+    let mut path = [0; MAXPATH];
+    let path_len = fetch_str(process, arg_addr(process, 0), &mut path)?;
+    let operation = log::begin_op();
+    let inode = create(&path[..path_len - 1], FileType::Dir, 0, 0).ok_or(Err::BadArg)?;
+    drop(inode);
+    drop(operation);
+    Ok(0)
+}
+
+pub fn sync(_process: &CurrentProc) -> Result<usize, Err> {
+    log::sync();
+    Ok(0)
+}
+
 pub fn chdir(process: &CurrentProc) -> Result<usize, Err> {
     let mut path = [0; MAXPATH];
     let n = fetch_str(process, arg_addr(process, 0), &mut path)?;
@@ -182,7 +305,7 @@ pub fn exec(process: &CurrentProc) -> Result<usize, Err> {
 fn create(path: &[u8], kind: FileType, major: i16, minor: i16) -> Option<Inode> {
     let (parent, name) = inode::nameiparent(path)?;
     let mut parent_guard = parent.lock();
-    if parent_guard.nlink() == 0 {
+    if parent_guard.nlink() == 0 || (kind == FileType::Dir && parent_guard.nlink() == i16::MAX) {
         return None;
     }
     if let Some(existing) = parent_guard.dir_lookup(&name, None) {
@@ -200,10 +323,13 @@ fn create(path: &[u8], kind: FileType, major: i16, minor: i16) -> Option<Inode> 
     created_guard.set_device(major, minor);
     created_guard.set_nlink(1);
     created_guard.update();
-    if !parent_guard.dir_link(&name, created.inum()) {
-        // Keep the ordinary ownership path on failure: mark the inode
-        // unlinked, release both sleep locks, then let `drop(created)` run
-        // iput and reclaim it. No leaked reference or forgotten guard.
+    let directory_entries = kind != FileType::Dir
+        || (created_guard.dir_link(b".", created.inum())
+            && created_guard.dir_link(b"..", parent.inum()));
+    if !directory_entries || !parent_guard.dir_link(&name, created.inum()) {
+        // `create` owns the only reference to an unlinked inode here.
+        // Mark it reclaimable, release both inode locks, then let ordinary
+        // `Inode::drop` truncate and free it exactly once.
         created_guard.set_nlink(0);
         created_guard.update();
         drop(created_guard);
@@ -212,10 +338,18 @@ fn create(path: &[u8], kind: FileType, major: i16, minor: i16) -> Option<Inode> 
         drop(parent);
         return None;
     }
+    if kind == FileType::Dir {
+        parent_guard.set_nlink(parent_guard.nlink() + 1);
+        parent_guard.update();
+    }
     drop(created_guard);
     drop(parent_guard);
     drop(parent);
     Some(created)
+}
+
+fn dir_name_eq(name: &[u8; DIRSIZ], wanted: &[u8]) -> bool {
+    name.get(..wanted.len()) == Some(wanted) && name[wanted.len()..].iter().all(|byte| *byte == 0)
 }
 
 fn encode_stat(stat: Stat) -> [u8; size_of::<Stat>()] {
