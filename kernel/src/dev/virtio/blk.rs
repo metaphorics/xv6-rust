@@ -5,8 +5,8 @@ use core::sync::atomic::{Ordering, fence};
 
 use abi::BSIZE;
 
-use super::mmio;
 use super::queue::{self, DESC_F_NEXT, DESC_F_WRITE, NUM, VirtqDesc};
+use super::transport;
 use crate::proc;
 use crate::sync::SpinLock;
 
@@ -106,7 +106,7 @@ pub fn init() {
     let (desc, avail, used) = queue::addresses();
     let mut disk = DISK.lock();
     *disk = DiskState::new();
-    mmio::init(desc, avail, used, NUM as u32);
+    transport::init(desc, avail, used, NUM as u32);
 }
 
 /// Transfer one fs block. `chan` uniquely identifies the cache buffer and is
@@ -163,7 +163,7 @@ pub fn rw(blockno: u32, data: &mut [u8; BSIZE], write: bool, chan: usize) {
 
     queue::push_avail(head as u16);
     fence(Ordering::SeqCst);
-    mmio::notify();
+    transport::notify();
 
     while disk.info[head].active {
         disk = proc::sleep(chan, disk);
@@ -183,7 +183,7 @@ pub fn rw(blockno: u32, data: &mut [u8; BSIZE], write: bool, chan: usize) {
 /// Complete every used-ring entry the device has published.
 pub fn intr() {
     let mut disk = DISK.lock();
-    mmio::acknowledge_interrupt();
+    transport::acknowledge_interrupt();
     fence(Ordering::SeqCst);
 
     while disk.used_idx != queue::used_idx() {

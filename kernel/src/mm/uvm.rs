@@ -4,8 +4,9 @@
 //! addresses below `p->sz`. The per-page loops, failure rollbacks, and
 //! the page-boundary-chunked copies are ported exactly from C.
 
-use crate::arch::PAGE_SIZE;
-use crate::arch::{PageTable, Perm, TRAMPOLINE, TRAPFRAME};
+use crate::arch::{
+    MAXVA, PAGE_SIZE, PageTable, Perm, TRAMPOLINE, TRAPFRAME, pte_addr, pte_writable,
+};
 use crate::err::Err;
 use crate::mm::addr::{PhysAddr, VirtAddr, page_round_up};
 use crate::mm::frame::PhysFrame;
@@ -76,7 +77,7 @@ pub fn copy(old: &PageTable, new: &mut PageTable, sz: u64) -> Result<(), Err> {
             i += PAGE;
             continue;
         };
-        let pa = PhysAddr((pte >> 10) << 12);
+        let pa = pte_addr(pte);
         let perm = Perm::from_pte_flags(pte);
         let Some(frame) = kalloc::alloc() else {
             unmap_range(new, 0, (i / PAGE) as usize, true);
@@ -242,12 +243,12 @@ pub fn copy_out(
 ) -> Result<(), Err> {
     while !src.is_empty() {
         let va0 = dstva & !(PAGE - 1);
-        if va0 >= crate::arch::riscv64::vm::MAXVA {
+        if va0 >= MAXVA {
             return Err(Err::BadArg);
         }
         let pa0 = resolve(pt, process_size, va0, false)?;
         let pte = pt.leaf_pte(va0).ok_or(Err::BadArg)?;
-        if !crate::arch::riscv64::vm::pte_writable(pte) {
+        if !pte_writable(pte) {
             return Err(Err::BadArg);
         }
         let n = ((PAGE - (dstva - va0)) as usize).min(src.len());

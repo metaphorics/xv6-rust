@@ -9,11 +9,16 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::addr::{PhysAddr, VirtAddr};
 use super::kalloc;
+#[cfg(target_arch = "riscv64")]
 use super::layout::{KERNBASE, PHYSTOP, PLIC, PLIC_SIZE, UART0, VIRTIO0};
+#[cfg(target_arch = "riscv64")]
+use crate::arch::TRAMPOLINE;
+#[cfg(target_arch = "riscv64")]
 use crate::arch::riscv64::trampoline;
-use crate::arch::{self, KSTACK_PAGES, PageTable, Perm, TRAMPOLINE, kstack};
+use crate::arch::{self, KSTACK_PAGES, PageTable, Perm, kstack};
 use crate::params::NPROC;
 
+#[cfg(target_arch = "riscv64")]
 unsafe extern "C" {
     /// End of kernel text, `kernel.ld` `PROVIDE(etext = .)` (vm.c:12).
     static etext: u8;
@@ -26,6 +31,7 @@ static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
 /// The page size, as the `u64` the mapping code computes in.
 const PAGE: u64 = arch::PAGE_SIZE as u64;
 
+#[cfg(target_arch = "riscv64")]
 /// Build the kernel page table (`kvminit`/`kvmmake`, vm.c:20-51).
 pub fn init() {
     let mut pt = PageTable::new().expect("kvmmake: no page for root");
@@ -98,6 +104,27 @@ pub fn init() {
     }
 
     KERNEL_ROOT.store(pt.leak_root().0, Ordering::Release);
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn init() {
+    let mut pt = PageTable::new().expect("kvmmake: no page for root");
+    crate::arch::x86_64::vm::map_kernel(&mut pt);
+    for p in 0..NPROC {
+        for page in 0..KSTACK_PAGES {
+            let frame = kalloc::alloc().expect("proc_mapstacks: kalloc");
+            kvmmap(
+                &mut pt,
+                VirtAddr(kstack(p).0 + page as u64 * PAGE),
+                frame.leak(),
+                PAGE,
+                Perm::R | Perm::W,
+            );
+        }
+    }
+    let root = pt.leak_root();
+    crate::arch::x86_64::vm::set_kernel_root(root);
+    KERNEL_ROOT.store(root.0, Ordering::Release);
 }
 
 /// Switch this hart onto the kernel page table (`kvminithart`,

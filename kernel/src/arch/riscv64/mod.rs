@@ -149,3 +149,15 @@ pub fn wait_for_interrupt() {
     // it cannot fault.
     unsafe { asm!("wfi", options(nomem, nostack)) };
 }
+
+pub fn uart_read(reg: u8) -> u8 {
+    // SAFETY: UART0 is the adapter's byte-wide 16550 MMIO window.
+    unsafe { core::ptr::read_volatile((0x1000_0000usize + reg as usize) as *const u8) }
+}
+
+pub fn uart_write(reg: u8, value: u8) {
+    // SAFETY: UART0 is the adapter's byte-wide 16550 MMIO window.
+    unsafe {
+        core::ptr::write_volatile((0x1000_0000usize + reg as usize) as *mut u8, value);
+    }
+}

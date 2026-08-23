@@ -7,13 +7,8 @@
 //! polls and never sleeps (uart.c:99-120). `uartintr` wakes blocked
 //! writers and hands input to the console (uart.c:138-155).
 
-use core::ptr;
-
 use crate::proc;
 use crate::sync::{SleepLock, pop_off, push_off};
-
-/// UART0 MMIO base (`memlayout.h:21`).
-const UART0: usize = 0x1000_0000;
 
 // Register offsets (`uart.c:25-39`). Some registers have different
 // meanings for read vs write; see http://byterunner.com/16550.html.
@@ -43,16 +38,12 @@ static TX_CHAN: u8 = 0;
 
 /// Read one UART register.
 fn read_reg(reg: u8) -> u8 {
-    // SAFETY: MMIO register read at the driver's fixed device address;
-    // the 16550 has no other accessor, and reads have no side effects
-    // beyond the device's own (the ISR read acknowledges interrupts).
-    unsafe { ptr::read_volatile((UART0 + reg as usize) as *const u8) }
+    crate::arch::uart_read(reg)
 }
 
 /// Write one UART register.
 fn write_reg(reg: u8, value: u8) {
-    // SAFETY: MMIO register write at the driver's fixed device address.
-    unsafe { ptr::write_volatile((UART0 + reg as usize) as *mut u8, value) }
+    crate::arch::uart_write(reg, value);
 }
 
 /// Program the UART: 38.4K baud, 8 data bits, FIFOs on, receive and

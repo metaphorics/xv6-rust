@@ -51,6 +51,13 @@ impl Context {
         s10: 0,
         s11: 0,
     };
+    pub const fn new(entry: u64, stack_top: u64) -> Context {
+        Context {
+            ra: entry,
+            sp: stack_top,
+            ..Context::ZERO
+        }
+    }
 }
 
 core::arch::global_asm!(

@@ -14,17 +14,38 @@ pub const KSTACK_PAGES: usize = 4;
 #[cfg(target_arch = "riscv64")]
 pub mod riscv64;
 
+#[cfg(target_arch = "x86_64")]
+pub mod x86_64;
+
 #[cfg(target_arch = "riscv64")]
 pub use riscv64::swtch::{Context, switch};
+
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::swtch::{Context, switch};
 
 #[cfg(target_arch = "riscv64")]
 pub use riscv64::trapframe::TrapFrame;
 
-#[cfg(target_arch = "riscv64")]
-pub use riscv64::vm::{PageTable, Perm, TRAMPOLINE, TRAPFRAME, activate, kstack};
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::trapframe::TrapFrame;
 
 #[cfg(target_arch = "riscv64")]
-pub use riscv64::{cpu_id, intr_get, intr_off, intr_on, wait_for_interrupt};
+pub use riscv64::vm::{
+    MAXVA, PageTable, Perm, TRAMPOLINE, TRAPFRAME, activate, kstack, prepare_user_table, pte_addr,
+    pte_writable, trampoline_addr,
+};
+
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::vm::{
+    MAXVA, PageTable, Perm, TRAMPOLINE, TRAPFRAME, activate, kstack, prepare_user_table, pte_addr,
+    pte_writable, trampoline_addr,
+};
+
+#[cfg(target_arch = "riscv64")]
+pub use riscv64::{cpu_id, intr_get, intr_off, intr_on, uart_read, uart_write, wait_for_interrupt};
+
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::{cpu_id, intr_get, intr_off, intr_on, uart_read, uart_write, wait_for_interrupt};
 
 #[cfg(not(any(target_arch = "riscv64", target_arch = "x86_64")))]
 compile_error!("unsupported target architecture (expected riscv64 or x86_64)");

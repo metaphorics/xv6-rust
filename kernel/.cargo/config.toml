@@ -9,4 +9,9 @@ rustflags = [
 ]
 
 [target.x86_64-unknown-none]
-rustflags = ["-Crelocation-model=static"]
+rustflags = [
+    "-Crelocation-model=static",
+    "-Ccode-model=small",
+    "-Cno-redzone=yes",
+    "-Clink-arg=-Tkernel/src/arch/x86_64/kernel.ld",
+]

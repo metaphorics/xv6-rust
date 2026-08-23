@@ -78,6 +78,14 @@ impl TrapFrame {
     pub fn set_ret(&mut self, value: u64) {
         self.a0 = value;
     }
+    pub fn set_exec(&mut self, entry: u64, sp: u64, argv: u64) {
+        self.epc = entry;
+        self.sp = sp;
+        self.a1 = argv;
+    }
+    pub fn set_entry_arg(&mut self, value: u64) {
+        self.a0 = value;
+    }
 
     /// Skip past the `ecall` on return to user mode
     /// (`p->trapframe->epc += 4`, trap.c:60-61).

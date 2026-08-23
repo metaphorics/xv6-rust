@@ -42,11 +42,16 @@ pub fn dispatch(p: &CurrentProc) {
         // Every ABI syscall has a concrete handler by M7.
     };
 
-    p.trapframe().set_ret(match ret {
+    let succeeded = ret.is_ok();
+    let value = match ret {
         Ok(value) => value as u64,
         // The C handlers' -1 (syscall.c:146).
         Err(_) => u64::MAX,
-    });
+    };
+    if succeeded && matches!(sys, Sys::Exec) {
+        p.trapframe().set_entry_arg(value);
+    }
+    p.trapframe().set_ret(value);
 }
 
 /// Fetch the nth word-sized syscall argument (`argraw`, syscall.c:35-54):

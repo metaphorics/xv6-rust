@@ -314,7 +314,7 @@ impl CurrentProc {
         // SAFETY: this is the running process's private trapframe owner.
         let private = unsafe { private(self.proc()) };
         let trapframe = private.trapframe_page.as_ref()?.addr();
-        proc_pagetable(trapframe)
+        proc_pagetable(self.slot, trapframe)
     }
 
     /// Atomically install a completed exec image, then release the old one.
@@ -336,10 +336,7 @@ impl CurrentProc {
             .expect("exec: old pagetable");
         private.sz = sz;
         private.name = name;
-        let trapframe = private.trapframe();
-        trapframe.epc = entry;
-        trapframe.sp = sp;
-        trapframe.a1 = argv;
+        private.trapframe().set_exec(entry, sp, argv);
         uvm::free_proc_table(old, old_sz);
     }
 }
@@ -433,7 +430,7 @@ fn allocproc() -> Option<(usize, SpinGuard<'static, ProcShared>)> {
         let pagetable = private
             .trapframe_page
             .as_ref()
-            .map(|frame| proc_pagetable(frame.addr()))
+            .map(|frame| proc_pagetable(slot, frame.addr()))
             .unwrap_or(None);
         if pagetable.is_none() {
             freeproc(slot, &mut shared);
@@ -443,10 +440,9 @@ fn allocproc() -> Option<(usize, SpinGuard<'static, ProcShared>)> {
 
         // Set up the context to start executing at forkret, which
         // returns to user space (proc.c:143-147).
-        private.context = Context::ZERO;
         let forkret_entry: extern "C" fn() = forkret;
-        private.context.ra = forkret_entry as usize as u64;
-        private.context.sp = ProcPrivate::kstack_top(slot);
+        private.context =
+            Context::new(forkret_entry as usize as u64, ProcPrivate::kstack_top(slot));
 
         return Some((slot, shared));
     }
@@ -455,14 +451,15 @@ fn allocproc() -> Option<(usize, SpinGuard<'static, ProcShared>)> {
 
 /// Create a user page table with no user memory, but with trampoline
 /// and trapframe pages (`proc_pagetable`, proc.c:172-205).
-fn proc_pagetable(trapframe_pa: PhysAddr) -> Option<PageTable> {
+fn proc_pagetable(slot: usize, trapframe_pa: PhysAddr) -> Option<PageTable> {
     let mut pt = PageTable::new()?;
+    arch::prepare_user_table(&mut pt, slot).ok()?;
 
     // Map the trampoline code at the highest user virtual address; only
     // the supervisor uses it, so no PTE_U (proc.c:185-193).
     pt.map_range(
         VirtAddr(TRAMPOLINE.0),
-        PhysAddr(arch::riscv64::trampoline::addr() as u64),
+        PhysAddr(arch::trampoline_addr()),
         PAGE_SIZE as u64,
         Perm::R | Perm::X,
     )
@@ -904,7 +901,7 @@ extern "C" fn forkret() {
         p.set_cwd(Some(crate::fs::inode::get(abi::ROOTDEV, abi::ROOTINO)));
         let argc =
             crate::exec::exec(b"/init", &[b"/init"]).unwrap_or_else(|_| panic!("exec /init"));
-        p.trapframe().set_ret(argc as u64);
+        p.trapframe().set_entry_arg(argc as u64);
     }
 
     crate::trap::usertrapret(&p);

@@ -1,6 +1,6 @@
 //! ELF program loading and argument-stack construction (`kernel/exec.c`).
 
-use crate::arch::{PAGE_SIZE, PageTable, Perm};
+use crate::arch::{MAXVA, PAGE_SIZE, PageTable, Perm};
 use crate::err::Err;
 use crate::fs::inode::InodeGuard;
 use crate::fs::log;
@@ -165,7 +165,7 @@ fn load_program_header(
         return Err(Err::BadArg);
     }
     let end = ph.vaddr.checked_add(ph.memsz).ok_or(Err::BadArg)?;
-    if end >= crate::arch::riscv64::vm::MAXVA {
+    if end >= MAXVA {
         return Err(Err::BadArg);
     }
     let mut perm = Perm::R;

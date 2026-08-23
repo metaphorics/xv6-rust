@@ -36,7 +36,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// (`__atomic_store_n(&started, 1, __ATOMIC_RELEASE)`, main.c:33).
 static BOOT_RELEASE: AtomicBool = AtomicBool::new(false);
 
+#[cfg(target_arch = "riscv64")]
 use crate::arch::riscv64::intr;
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86_64::intr;
 
 /// Supervisor-mode entry, the `mret` target of `start`, with the hart id
 /// in `a0`.

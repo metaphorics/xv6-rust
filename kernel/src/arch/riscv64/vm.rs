@@ -97,6 +97,10 @@ const fn pte2pa(pte: u64) -> u64 {
     (pte >> 10) << 12
 }
 
+pub const fn pte_addr(pte: u64) -> PhysAddr {
+    PhysAddr(pte2pa(pte))
+}
+
 /// An Sv39 page table owning its pages (the `pagetable_t` of vm.c).
 ///
 /// Dropping frees every page-table page via `freewalk` (vm.c:265-283),
@@ -370,4 +374,12 @@ fn zero(pa: PhysAddr) {
     for i in 0..512 {
         pte_write(table, i, 0);
     }
+}
+
+pub fn prepare_user_table(_pt: &mut PageTable, _slot: usize) -> Result<(), ()> {
+    Ok(())
+}
+
+pub fn trampoline_addr() -> u64 {
+    super::trampoline::addr() as u64
 }
