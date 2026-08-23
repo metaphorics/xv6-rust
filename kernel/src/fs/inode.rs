@@ -199,6 +199,7 @@ pub fn reclaim(dev: u32) {
         drop(inode.lock());
         drop(inode);
         drop(operation);
+        crate::printk::line(format_args!("ireclaim: completed inode {inum}"));
     }
 }
 

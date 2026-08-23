@@ -11,6 +11,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
+const GRIND_TIMEOUT: Duration = Duration::from_secs(120);
+const LOG_KILL_DELAYS_MS: [u64; 5] = [1_200, 1_600, 2_000, 2_400, 2_800];
+const ORPHAN_KILL_DELAYS_MS: [u64; 3] = [0, 250, 500];
 const USER_PROGRAMS: [&str; 19] = [
     "init",
     "sh",
@@ -56,8 +59,11 @@ fn main() {
 
 #[derive(Clone, Copy)]
 enum TestKind {
+    All,
     Quick,
     Full,
+    Forktest,
+    Grind,
     Crash,
     Log,
     Forphan,
@@ -88,8 +94,11 @@ fn parse_test_args(args: &[String], program: Option<&str>) -> (String, TestKind)
             usage(program);
         }
         test = Some(match args[index].as_str() {
+            "all" => TestKind::All,
             "quick" => TestKind::Quick,
             "full" => TestKind::Full,
+            "forktest" => TestKind::Forktest,
+            "grind" => TestKind::Grind,
             "crash" => TestKind::Crash,
             "log" => TestKind::Log,
             "forphan" => TestKind::Forphan,
@@ -98,7 +107,7 @@ fn parse_test_args(args: &[String], program: Option<&str>) -> (String, TestKind)
         });
         index += 1;
     }
-    (arch, test.unwrap_or(TestKind::Full))
+    (arch, test.unwrap_or(TestKind::All))
 }
 
 fn check() {
@@ -211,7 +220,7 @@ fn test_xv6(arch: &str, test: TestKind) {
     require_arch(arch);
     let root = workspace_root();
     let extra_programs: &[&str] = match test {
-        TestKind::Quick | TestKind::Full => &["usertests"],
+        TestKind::All | TestKind::Quick | TestKind::Full => &["usertests"],
         _ => &[],
     };
     let harness = TestHarness {
@@ -222,13 +231,17 @@ fn test_xv6(arch: &str, test: TestKind) {
         qemu: require_qemu(arch),
     };
     match test {
-        TestKind::Quick | TestKind::Full => harness.usertests(test),
-        TestKind::Crash => {
-            harness.log();
-            harness.forphan();
-            harness.dorphan();
-            println!("XTASK: crash recovery tests ok");
+        TestKind::All => {
+            harness.usertests(TestKind::Full);
+            harness.forktest();
+            harness.grind();
+            harness.crash();
+            println!("XTASK: all acceptance tests passed");
         }
+        TestKind::Quick | TestKind::Full => harness.usertests(test),
+        TestKind::Forktest => harness.forktest(),
+        TestKind::Grind => harness.grind(),
+        TestKind::Crash => harness.crash(),
         TestKind::Log => harness.log(),
         TestKind::Forphan => harness.forphan(),
         TestKind::Dorphan => harness.dorphan(),
@@ -284,13 +297,79 @@ impl TestHarness {
         println!("XTASK: usertests passed");
     }
 
+    fn forktest(&self) {
+        println!("==> standalone forktest");
+        let image = self.fresh_image();
+        let (mut child, mut console) = spawn_qemu(self.qemu, &self.arch, &self.kernel, &image);
+        send_after_prompt(&mut child, &mut console, b"forktest\n");
+        let matched = console.wait_for_any(
+            &mut child,
+            &[
+                b"fork test OK",
+                b"fork claimed to work N times!",
+                b"wait stopped early",
+                b"wait got too many",
+                b"panic",
+            ],
+            TIMEOUT,
+        );
+        if matched != 0 {
+            kill(&mut child);
+            fail("forktest reported a failure");
+        }
+        console.wait_for(&mut child, b"$ ");
+        kill(&mut child);
+        println!("XTASK: standalone forktest passed");
+    }
+
+    fn grind(&self) {
+        println!("==> bounded standalone grind");
+        let image = self.fresh_image();
+        let (mut child, mut console) = spawn_qemu(self.qemu, &self.arch, &self.kernel, &image);
+        send_after_prompt(&mut child, &mut console, b"grind\n");
+        let first = console.wait_for_any(
+            &mut child,
+            &[b"A", b"B", b"grind:", b"panic", b"FAILED"],
+            GRIND_TIMEOUT,
+        );
+        if first >= 2 {
+            kill(&mut child);
+            fail("grind reported a failure before both workers progressed");
+        }
+        let second_worker = if first == 0 {
+            b"B".as_slice()
+        } else {
+            b"A".as_slice()
+        };
+        let second = console.wait_for_any(
+            &mut child,
+            &[second_worker, b"grind:", b"panic", b"FAILED"],
+            GRIND_TIMEOUT,
+        );
+        if second != 0 {
+            kill(&mut child);
+            fail("grind reported a failure before both workers progressed");
+        }
+        kill(&mut child);
+        println!("XTASK: grind workers A and B made progress");
+    }
+
+    fn crash(&self) {
+        self.log();
+        self.forphan();
+        self.dorphan();
+        println!("XTASK: crash recovery tests ok");
+    }
+
     fn log(&self) {
         println!("==> log crash recovery");
-        for attempt in 1..=5 {
+        let mut replayed = 0;
+        for (index, delay_ms) in LOG_KILL_DELAYS_MS.iter().copied().enumerate() {
+            let attempt = index + 1;
             let image = self.fresh_image();
             let (mut child, mut console) = spawn_qemu(self.qemu, &self.arch, &self.kernel, &image);
             send_after_prompt(&mut child, &mut console, b"logstress f0 f1 f2 f3 f4 f5\n");
-            thread::sleep(Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(delay_ms));
             kill(&mut child);
 
             let (mut child, mut console) = spawn_qemu(self.qemu, &self.arch, &self.kernel, &image);
@@ -299,39 +378,85 @@ impl TestHarness {
                 &[b"recovering tail ", b"init: starting sh"],
                 TIMEOUT,
             ) == 0;
-            if recovered {
-                send_after_prompt(&mut child, &mut console, b"ls\n");
-                console.wait_for(&mut child, b"\nf5 ");
-                kill(&mut child);
-                println!("XTASK: log recovery ok (attempt {attempt})");
-                return;
-            }
+            self.prove_recovery(
+                &mut child,
+                &mut console,
+                recovered.then_some((b"ls\n", b"\nf5 ".as_slice())),
+            );
             kill(&mut child);
-            println!("==> log attempt {attempt} did not leave a committed transaction");
+            if recovered {
+                replayed += 1;
+                println!("XTASK: log replay attempt {attempt} proved after {delay_ms} ms");
+            } else {
+                println!("==> log attempt {attempt} had no committed transaction");
+            }
         }
-        fail("log recovery did not trigger in 5 attempts");
+        if replayed == 0 {
+            fail("log recovery did not replay in 5 varied attempts");
+        }
+        println!("XTASK: {replayed}/5 log reboots replayed and passed sync proof");
     }
 
     fn forphan(&self) {
-        self.orphan(b"forphan\n", "forphan");
+        self.orphan(
+            b"forphan\n",
+            "forphan",
+            (b"ls file0\n", b"ls: cannot open file0\n"),
+        );
     }
 
     fn dorphan(&self) {
-        self.orphan(b"dorphan\n", "dorphan");
+        self.orphan(
+            b"dorphan\n",
+            "dorphan",
+            (b"ls dd\n", b"ls: cannot open dd\n"),
+        );
     }
 
-    fn orphan(&self, command: &[u8], name: &str) {
+    fn orphan(&self, command: &[u8], name: &str, absent: (&[u8], &[u8])) {
         println!("==> {name} crash recovery");
-        let image = self.fresh_image();
-        let (mut child, mut console) = spawn_qemu(self.qemu, &self.arch, &self.kernel, &image);
-        send_after_prompt(&mut child, &mut console, command);
-        console.wait_for(&mut child, b"wait for kill and reclaim");
-        kill(&mut child);
+        for (index, delay_ms) in ORPHAN_KILL_DELAYS_MS.iter().copied().enumerate() {
+            let iteration = index + 1;
+            let image = self.fresh_image();
+            let (mut child, mut console) = spawn_qemu(self.qemu, &self.arch, &self.kernel, &image);
+            send_after_prompt(&mut child, &mut console, command);
+            console.wait_for(&mut child, b"wait for kill and reclaim");
+            thread::sleep(Duration::from_millis(delay_ms));
+            kill(&mut child);
 
-        let (mut child, mut console) = spawn_qemu(self.qemu, &self.arch, &self.kernel, &image);
-        console.wait_for(&mut child, b"ireclaim: orphaned inode ");
-        kill(&mut child);
-        println!("XTASK: {name} recovery ok");
+            let (mut child, mut console) = spawn_qemu(self.qemu, &self.arch, &self.kernel, &image);
+            console.wait_for(&mut child, b"ireclaim: completed inode ");
+            self.prove_recovery(&mut child, &mut console, Some(absent));
+            kill(&mut child);
+            println!("XTASK: {name} recovery iteration {iteration} proved after {delay_ms} ms");
+        }
+    }
+
+    fn prove_recovery(
+        &self,
+        child: &mut Child,
+        console: &mut Console,
+        recovered_check: Option<(&[u8], &[u8])>,
+    ) {
+        send_after_prompt(child, console, b"sync\n");
+        finish_command_to_prompt(child, console, b"sync\n", None);
+
+        if let Some((command, expected)) = recovered_check {
+            send_input(child, command);
+            finish_command_to_prompt(child, console, command, Some(expected));
+        }
+
+        send_input(child, b"echo recovery-ok > recovery-proof\n");
+        finish_command_to_prompt(child, console, b"echo recovery-ok > recovery-proof\n", None);
+        send_input(child, b"cat recovery-proof\n");
+        finish_command_to_prompt(
+            child,
+            console,
+            b"cat recovery-proof\n",
+            Some(b"recovery-ok\n"),
+        );
+        send_input(child, b"rm recovery-proof\n");
+        finish_command_to_prompt(child, console, b"rm recovery-proof\n", None);
     }
 }
 
@@ -657,8 +782,26 @@ fn command_done(child: &mut Child, console: &mut Console, input: &[u8]) {
     console.wait_for(child, b"\n");
 }
 
+fn finish_command_to_prompt(
+    child: &mut Child,
+    console: &mut Console,
+    input: &[u8],
+    output: Option<&[u8]>,
+) {
+    console.wait_for(child, &input[..input.len() - 1]);
+    console.wait_for(child, b"\n");
+    if let Some(output) = output {
+        console.wait_for(child, output);
+    }
+    console.wait_for(child, b"$ ");
+}
+
 fn send_after_prompt(child: &mut Child, console: &mut Console, input: &[u8]) {
     console.wait_for(child, b"$ ");
+    send_input(child, input);
+}
+
+fn send_input(child: &mut Child, input: &[u8]) {
     let Some(stdin) = child.stdin.as_mut() else {
         kill(child);
         fail("qemu stdin is not piped");
@@ -698,7 +841,9 @@ fn usage(program: Option<&str>) -> ! {
     let name = program.unwrap_or("cargo xtask");
     eprintln!("usage: {name} check");
     eprintln!("       {name} run --arch <riscv64|x86_64> [--echo-test]");
-    eprintln!("       {name} test --arch <riscv64|x86_64> [quick|full|crash|log|forphan|dorphan]");
+    eprintln!(
+        "       {name} test --arch <riscv64|x86_64> [all|quick|full|forktest|grind|crash|log|forphan|dorphan]"
+    );
     std::process::exit(2)
 }
 
