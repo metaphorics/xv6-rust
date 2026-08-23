@@ -45,17 +45,17 @@ use crate::arch::x86_64::intr;
 /// in `a0`.
 extern "C" fn main(hartid: usize) -> ! {
     if hartid != 0 {
-        // Wait for hart 0's boot (main.c:34-35).
         while !BOOT_RELEASE.load(Ordering::Acquire) {
             core::hint::spin_loop();
         }
+        // APs leave their temporary climb tables only after the BSP publishes the kernel root.
+        mm::kernel_map::activate_hart();
 
+        trap::init_hart();
+        intr::init_hart(hartid);
         println!("hart {} running", hartid);
-        mm::kernel_map::activate_hart(); // turn on paging (main.c:39)
-        trap::init_hart(); // install kernel trap vector (main.c:40)
-        intr::init_hart(hartid); // ask PLIC for device interrupts (main.c:41)
         arch::intr_on();
-        proc::scheduler(); // run processes (main.c:44)
+        proc::scheduler();
     }
 
     dev::console::init(); // consoleinit (main.c:14)
@@ -69,6 +69,7 @@ extern "C" fn main(hartid: usize) -> ! {
     trap::init_hart(); // install kernel trap vector (main.c:24)
     intr::init(); // set up interrupt controller (main.c:25)
     intr::init_hart(0); // ask PLIC for device interrupts (main.c:26)
+    arch::start_other_cpus();
     dev::virtio::blk::init(); // emulated hard disk (main.c:30)
     proc::user_init(); // first user process (main.c:30)
 

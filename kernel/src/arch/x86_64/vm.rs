@@ -7,6 +7,7 @@ use crate::arch::{KSTACK_PAGES, PAGE_SIZE};
 use crate::mm::addr::{PhysAddr, VirtAddr, px};
 use crate::mm::frame::PhysFrame;
 use crate::mm::kalloc;
+use crate::params::NCPU;
 
 const PTE_P: u64 = 1 << 0;
 const PTE_W: u64 = 1 << 1;
@@ -17,13 +18,15 @@ const PTE_NX: u64 = 1 << 63;
 const PTE_ADDR: u64 = 0x000f_ffff_ffff_f000;
 const HUGE_SIZE: u64 = 2 * 1024 * 1024;
 
-pub const MAXVA: u64 = 1 << 47;
+pub const MAXVA: u64 = 1 << 38;
 pub const TRAMPOLINE: VirtAddr = VirtAddr(MAXVA - PAGE_SIZE as u64);
 pub const TRAPFRAME: VirtAddr = VirtAddr(TRAMPOLINE.0 - PAGE_SIZE as u64);
+pub(super) const KERNEL_HIGH_BASE: u64 = 0xffff_8000_0000_0000;
+pub(super) const TRAP_ENTRY_VA: u64 = KERNEL_HIGH_BASE;
 
 pub const fn kstack(p: usize) -> VirtAddr {
     let stride = (KSTACK_PAGES + 1) as u64 * PAGE_SIZE as u64;
-    VirtAddr(TRAMPOLINE.0 - (p as u64 + 1) * stride)
+    VirtAddr(KERNEL_HIGH_BASE + 4 * 1024 * 1024 + p as u64 * stride)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -89,7 +92,10 @@ impl PageTable {
         assert!(pa.0.is_multiple_of(page), "mappages: pa not aligned");
         assert!(size != 0 && size.is_multiple_of(page), "mappages: size");
         let last = va.0.checked_add(size - page).expect("mappages: overflow");
-        assert!(last < MAXVA, "walk: va >= MAXVA");
+        assert!(
+            valid_va(va.0) && valid_va(last) && (va.0 < MAXVA) == (last < MAXVA),
+            "walk: non-canonical range"
+        );
         let mut a = va.0;
         let mut p = pa.0;
         loop {
@@ -178,8 +184,12 @@ fn leaf_flags(perm: Perm) -> u64 {
         }
 }
 
+const fn valid_va(va: u64) -> bool {
+    va < MAXVA || va >= KERNEL_HIGH_BASE
+}
+
 fn walk(root: PhysAddr, va: u64, alloc: bool) -> Option<*mut u64> {
-    assert!(va < MAXVA, "walk: va >= MAXVA");
+    assert!(valid_va(va), "walk: non-canonical va");
     let mut table = table_of(root);
     for level in (1..=3).rev() {
         let index = px(level, va);
@@ -320,21 +330,76 @@ fn map_kernel_identity(pt: &mut PageTable) -> Result<(), ()> {
     map_huge(pt.root, 0xc000_0000, 0x1_0000_0000, Perm::R | Perm::W)
 }
 
-pub fn map_kernel(pt: &mut PageTable) {
-    map_kernel_identity(pt).expect("x86 kernel map");
+fn map_cpu_tables(pt: &mut PageTable) -> Result<(), ()> {
+    for cpu in 0..NCPU {
+        pt.map_range(
+            VirtAddr(super::gdt::gdt_va(cpu)),
+            PhysAddr(super::gdt::gdt_addr(cpu)),
+            PAGE_SIZE as u64,
+            Perm::R | Perm::W,
+        )?;
+        pt.map_range(
+            VirtAddr(super::gdt::tss_va(cpu)),
+            PhysAddr(super::gdt::tss_addr(cpu)),
+            PAGE_SIZE as u64,
+            Perm::R | Perm::W,
+        )?;
+    }
+    Ok(())
 }
 
-#[unsafe(no_mangle)]
-pub static X86_KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
+pub fn map_kernel(pt: &mut PageTable) {
+    map_kernel_identity(pt).expect("x86 kernel map");
+    pt.map_range(
+        VirtAddr(super::boot::AP_BOOT_ADDR as u64),
+        PhysAddr(super::boot::AP_BOOT_ADDR as u64),
+        PAGE_SIZE as u64,
+        Perm::R | Perm::W,
+    )
+    .expect("x86 AP bootstrap map");
+    pt.map_range(
+        VirtAddr(super::traps::IDT_VA),
+        PhysAddr(super::traps::idt_addr()),
+        PAGE_SIZE as u64,
+        Perm::R,
+    )
+    .expect("x86 IDT map");
+    pt.map_range(
+        VirtAddr(TRAP_ENTRY_VA),
+        PhysAddr(trampoline_addr()),
+        PAGE_SIZE as u64,
+        Perm::R | Perm::X,
+    )
+    .expect("x86 trap entry map");
+    map_cpu_tables(pt).expect("x86 GDT/TSS map");
+}
+
+unsafe extern "C" {
+    static X86_KERNEL_CR3: AtomicU64;
+}
 
 pub fn set_kernel_root(root: PhysAddr) {
-    X86_KERNEL_CR3.store(root.0, Ordering::Release);
+    // SAFETY: the trampoline owns this atomic word and the BSP publishes it once.
+    unsafe { X86_KERNEL_CR3.store(root.0, Ordering::Release) };
 }
 
 pub fn prepare_user_table(pt: &mut PageTable, slot: usize) -> Result<(), ()> {
-    map_kernel_identity(pt)?;
-    let root = PhysAddr(X86_KERNEL_CR3.load(Ordering::Acquire));
+    // SAFETY: the BSP published the kernel root before allocating processes.
+    let root = PhysAddr(unsafe { X86_KERNEL_CR3.load(Ordering::Acquire) });
     assert!(root.0 != 0, "user table before kernel table");
+    pt.map_range(
+        VirtAddr(super::traps::IDT_VA),
+        PhysAddr(super::traps::idt_addr()),
+        PAGE_SIZE as u64,
+        Perm::R,
+    )?;
+    pt.map_range(
+        VirtAddr(TRAP_ENTRY_VA),
+        PhysAddr(trampoline_addr()),
+        PAGE_SIZE as u64,
+        Perm::R | Perm::X,
+    )?;
+    map_cpu_tables(pt)?;
     for page in 0..KSTACK_PAGES {
         let va = kstack(slot).0 + page as u64 * PAGE_SIZE as u64;
         let pa = lookup_any(root, va).expect("kernel stack mapping");

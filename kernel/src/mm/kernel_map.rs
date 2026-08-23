@@ -12,10 +12,8 @@ use super::kalloc;
 #[cfg(target_arch = "riscv64")]
 use super::layout::{KERNBASE, PHYSTOP, PLIC, PLIC_SIZE, UART0, VIRTIO0};
 #[cfg(target_arch = "riscv64")]
-use crate::arch::TRAMPOLINE;
-#[cfg(target_arch = "riscv64")]
 use crate::arch::riscv64::trampoline;
-use crate::arch::{self, KSTACK_PAGES, PageTable, Perm, kstack};
+use crate::arch::{self, KSTACK_PAGES, PageTable, Perm, TRAMPOLINE, kstack};
 use crate::params::NPROC;
 
 #[cfg(target_arch = "riscv64")]
@@ -110,6 +108,13 @@ pub fn init() {
 pub fn init() {
     let mut pt = PageTable::new().expect("kvmmake: no page for root");
     crate::arch::x86_64::vm::map_kernel(&mut pt);
+    kvmmap(
+        &mut pt,
+        TRAMPOLINE,
+        PhysAddr(arch::trampoline_addr()),
+        PAGE,
+        Perm::R | Perm::X,
+    );
     for p in 0..NPROC {
         for page in 0..KSTACK_PAGES {
             let frame = kalloc::alloc().expect("proc_mapstacks: kalloc");

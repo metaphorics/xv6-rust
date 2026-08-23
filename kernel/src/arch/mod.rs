@@ -42,10 +42,16 @@ pub use x86_64::vm::{
 };
 
 #[cfg(target_arch = "riscv64")]
-pub use riscv64::{cpu_id, intr_get, intr_off, intr_on, uart_read, uart_write, wait_for_interrupt};
+pub use riscv64::{
+    cpu_id, intr_get, intr_off, intr_on, start_other_cpus, uart_read, uart_write,
+    wait_for_interrupt,
+};
 
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::{cpu_id, intr_get, intr_off, intr_on, uart_read, uart_write, wait_for_interrupt};
+pub use x86_64::{
+    cpu_id, intr_get, intr_off, intr_on, start_other_cpus, uart_read, uart_write,
+    wait_for_interrupt,
+};
 
 #[cfg(not(any(target_arch = "riscv64", target_arch = "x86_64")))]
 compile_error!("unsupported target architecture (expected riscv64 or x86_64)");

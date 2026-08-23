@@ -17,7 +17,13 @@ SECTIONS
   PROVIDE(_kernel_start = .);
   .text : {
     KEEP(*(.text.boot))
+    . = ALIGN(0x1000);
+    PROVIDE(x86_trampoline_start = .);
     KEEP(*(.text.trap))
+    PROVIDE(x86_trampoline_end = .);
+    ASSERT(x86_trampoline_end - x86_trampoline_start <= 0x1000,
+           "x86 trap trampoline exceeds one page")
+    . = ALIGN(0x1000);
     *(.text .text.*)
     . = ALIGN(0x1000);
     PROVIDE(etext = .);

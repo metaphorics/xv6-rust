@@ -2,6 +2,8 @@
 
 use core::cell::UnsafeCell;
 
+use crate::params::NCPU;
+
 pub const KERNEL_CODE: u16 = 0x08;
 pub const KERNEL_DATA: u16 = 0x10;
 const TSS_SELECTOR: u16 = 0x28;
@@ -35,25 +37,45 @@ struct DescriptorTablePointer {
     base: u64,
 }
 
+#[repr(align(4096))]
 struct Shared<T>(UnsafeCell<T>);
-// SAFETY: M9 has one CPU; interrupt masking serializes updates to these tables.
+// SAFETY: each page is accessed only by its owning CPU after BSP initialization.
 unsafe impl<T> Sync for Shared<T> {}
 
-static TSS: Shared<Tss> = Shared(UnsafeCell::new(Tss::ZERO));
-static GDT: Shared<[u64; 7]> = Shared(UnsafeCell::new([0; 7]));
+static TSS: [Shared<Tss>; NCPU] = [const { Shared(UnsafeCell::new(Tss::ZERO)) }; NCPU];
+static GDT: [Shared<[u64; 7]>; NCPU] = [const { Shared(UnsafeCell::new([0; 7])) }; NCPU];
 
-pub fn init(initial_rsp0: u64) {
-    set_rsp0(initial_rsp0);
-    let tss_base = TSS.0.get() as u64;
+const TABLE_VA_BASE: u64 = super::vm::KERNEL_HIGH_BASE + 3 * 1024 * 1024;
+
+pub fn gdt_addr(cpu: usize) -> u64 {
+    GDT[cpu].0.get() as u64
+}
+
+pub fn tss_addr(cpu: usize) -> u64 {
+    TSS[cpu].0.get() as u64
+}
+
+pub fn gdt_va(cpu: usize) -> u64 {
+    TABLE_VA_BASE - cpu as u64 * 2 * 4096
+}
+
+pub fn tss_va(cpu: usize) -> u64 {
+    gdt_va(cpu) - 4096
+}
+
+pub fn init(cpu: usize, initial_rsp0: u64) {
+    set_rsp0_for(cpu, initial_rsp0);
+    let gdt = GDT[cpu].0.get();
+    let tss_base = tss_va(cpu);
     let limit = (core::mem::size_of::<Tss>() - 1) as u64;
     let tss_low = (limit & 0xffff)
         | ((tss_base & 0x00ff_ffff) << 16)
         | (0x89 << 40)
         | (((limit >> 16) & 0xf) << 48)
         | (((tss_base >> 24) & 0xff) << 56);
-    // SAFETY: the bootstrap CPU is the only writer during initialization.
+    // SAFETY: this CPU exclusively initializes its static descriptor row.
     unsafe {
-        *GDT.0.get() = [
+        *gdt = [
             0,
             0x00af_9a00_0000_ffff,
             0x00af_9200_0000_ffff,
@@ -65,9 +87,9 @@ pub fn init(initial_rsp0: u64) {
     }
     let gdtr = DescriptorTablePointer {
         limit: (core::mem::size_of::<[u64; 7]>() - 1) as u16,
-        base: GDT.0.get() as u64,
+        base: gdt_va(cpu),
     };
-    // SAFETY: descriptors are fully initialized and remain static forever.
+    // SAFETY: both high aliases are mapped to this CPU's static pages.
     unsafe {
         core::arch::asm!(
             "lgdt [{}]",
@@ -89,7 +111,13 @@ pub fn init(initial_rsp0: u64) {
     }
 }
 
+fn set_rsp0_for(cpu: usize, stack_top: u64) {
+    // SAFETY: callers update only their CPU's TSS while interrupts are disabled.
+    unsafe {
+        core::ptr::addr_of_mut!((*TSS[cpu].0.get()).rsp[0]).write_unaligned(stack_top);
+    }
+}
+
 pub fn set_rsp0(stack_top: u64) {
-    // SAFETY: M9 is UP and callers update rsp0 only with interrupts disabled.
-    unsafe { core::ptr::addr_of_mut!((*TSS.0.get()).rsp[0]).write_unaligned(stack_top) };
+    set_rsp0_for(super::cpu_id(), stack_top);
 }

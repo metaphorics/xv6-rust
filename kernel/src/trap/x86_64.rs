@@ -42,8 +42,9 @@ pub fn init_hart() {
     let rsp: u64;
     // SAFETY: reads the current kernel stack pointer without changing it.
     unsafe { asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)) };
-    gdt::init(rsp);
-    traps::init();
+    let cpu = arch::cpu_id();
+    gdt::init(cpu, rsp);
+    traps::init(cpu);
 }
 
 #[unsafe(no_mangle)]
@@ -163,9 +164,11 @@ fn device_interrupt(vector: u64) -> u32 {
 }
 
 pub fn clockintr() {
-    let mut ticks = TICKS.lock();
-    *ticks += 1;
-    proc::wakeup(TICKS.chan());
+    if arch::cpu_id() == 0 {
+        let mut ticks = TICKS.lock();
+        *ticks += 1;
+        proc::wakeup(TICKS.chan());
+    }
 }
 
 pub fn usertrapret(p: &CurrentProc) -> ! {

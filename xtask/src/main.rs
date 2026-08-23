@@ -537,7 +537,7 @@ fn spawn_qemu(qemu: &str, arch: &str, kernel: &Path, image: &Path) -> (Child, Co
                 "-m",
                 "128M",
                 "-smp",
-                "1",
+                "3",
                 "-display",
                 "none",
                 "-serial",

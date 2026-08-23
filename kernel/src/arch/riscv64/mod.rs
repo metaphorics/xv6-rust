@@ -23,6 +23,9 @@ pub fn cpu_id() -> usize {
     id
 }
 
+/// QEMU enters every RISC-V hart directly; there are no parked APs to launch.
+pub fn start_other_cpus() {}
+
 /// Enable device interrupts (`intr_on`, riscv.h:309-313).
 pub fn intr_on() {
     // SAFETY: `csrs` sets only the SIE bit of sstatus; no memory effect.

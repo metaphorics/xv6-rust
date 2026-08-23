@@ -10,10 +10,44 @@ pub mod traps;
 pub mod vm;
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicU32, Ordering};
 
-/// M9 is deliberately uniprocessor; the bootstrap CPU is CPU 0.
+use crate::params::NCPU;
+
+const UNASSIGNED_APIC_ID: u32 = u32::MAX;
+static LAPIC_IDS: [AtomicU32; NCPU] = [const { AtomicU32::new(UNASSIGNED_APIC_ID) }; NCPU];
+
+/// Map the calling local APIC id to the contiguous per-CPU table index.
 pub fn cpu_id() -> usize {
-    0
+    let apic_id = core::arch::x86_64::__cpuid(1).ebx >> 24;
+    for (cpu, registered) in LAPIC_IDS.iter().enumerate() {
+        if registered.load(Ordering::Acquire) == apic_id {
+            return cpu;
+        }
+    }
+
+    // The BSP reaches lock-backed code before it launches the APs.
+    if LAPIC_IDS[0]
+        .compare_exchange(
+            UNASSIGNED_APIC_ID,
+            apic_id,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        return 0;
+    }
+    panic!("unregistered local APIC id {apic_id}");
+}
+
+pub(crate) fn register_cpu(cpu: usize, apic_id: u32) {
+    assert!(cpu < NCPU, "cpu index outside per-cpu table");
+    LAPIC_IDS[cpu].store(apic_id, Ordering::Release);
+}
+
+pub fn start_other_cpus() {
+    boot::start_aps();
 }
 
 pub fn intr_on() {
