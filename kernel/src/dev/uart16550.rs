@@ -10,7 +10,7 @@
 use core::ptr;
 
 use crate::proc;
-use crate::sync::{pop_off, push_off, SleepLock};
+use crate::sync::{SleepLock, pop_off, push_off};
 
 /// UART0 MMIO base (`memlayout.h:21`).
 const UART0: usize = 0x1000_0000;
@@ -87,12 +87,17 @@ pub fn write(buf: &[u8]) {
     TX_LOCK.acquire();
 
     for &b in buf {
-        // Sleep until the transmit holding register is idle: check, and
-        // if busy sleep on the channel `uartintr` wakes (uart.c:83-96).
-        while read_reg(LSR) & LSR_TX_IDLE == 0 {
-            proc::sleep0((&raw const TX_CHAN) as usize);
+        // Register before checking the hardware so an interrupt between
+        // the check and sleep cannot be lost. A busy transmitter sleeps;
+        // after wakeup the loop retries this same byte (uart.c:83-96).
+        loop {
+            proc::sleep_prepare((&raw const TX_CHAN) as usize);
+            if read_reg(LSR) & LSR_TX_IDLE != 0 {
+                write_reg(THR, b);
+                break;
+            }
+            proc::sleep_commit();
         }
-        write_reg(THR, b);
     }
 
     TX_LOCK.release();

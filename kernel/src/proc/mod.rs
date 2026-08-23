@@ -35,8 +35,10 @@ use core::cell::UnsafeCell;
 use core::mem;
 use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
-use crate::arch::{self, kstack, Context, PageTable, Perm, TrapFrame, TRAPFRAME, TRAMPOLINE};
-use crate::arch::PAGE_SIZE;
+use crate::arch::{
+    self, Context, KSTACK_PAGES, PAGE_SIZE, PageTable, Perm, TRAMPOLINE, TRAPFRAME, TrapFrame,
+    kstack,
+};
 use crate::cpu;
 use crate::err::Err;
 use crate::mm::addr::{PhysAddr, VirtAddr};
@@ -44,7 +46,7 @@ use crate::mm::frame::PhysFrame;
 use crate::mm::kalloc;
 use crate::mm::uvm;
 use crate::params::NPROC;
-use crate::sync::{pop_off, push_off, SpinGuard, SpinLock};
+use crate::sync::{SpinGuard, SpinLock, pop_off, push_off};
 
 /// Helps ensure that wakeups of `wait()`ing parents are not lost; must
 /// be acquired before any `shared` lock (`wait_lock`, proc.c:23-27).
@@ -102,19 +104,14 @@ pub struct ProcPrivate {
 }
 
 impl ProcPrivate {
-    /// The kernel stack top for a slot (`p->kstack + PGSIZE`; `kstack`
-    /// itself is derived from the slot index, proc.c:57).
+    /// The top of this slot's multi-page kernel stack.
     fn kstack_top(slot: usize) -> u64 {
-        kstack(slot).0 + PAGE_SIZE as u64
+        kstack(slot).0 + (KSTACK_PAGES * PAGE_SIZE) as u64
     }
 
     /// The trapframe view into this slot's page.
-    fn trapframe(&self) -> &mut TrapFrame {
-        let pa = self
-            .trapframe_page
-            .as_ref()
-            .expect("trapframe page")
-            .addr();
+    fn trapframe(&mut self) -> &mut TrapFrame {
+        let pa = self.trapframe_page.as_ref().expect("trapframe page").addr();
         // SAFETY: the page is owned by this slot (the PhysFrame above)
         // and touched only through this process's single running flow —
         // the private-fields discipline of proc.h:95-103.
@@ -141,28 +138,29 @@ pub struct Proc {
 // lock — the disciplines proc.h documents and this module enforces.
 unsafe impl Sync for Proc {}
 
-const PROC_EMPTY: Proc = Proc {
-    shared: SpinLock::new(ProcShared {
-        state: ProcState::Unused,
-        chan: 0,
-        killed: false,
-        xstate: 0,
-        pid: 0,
-    }),
-    parent: UnsafeCell::new(PARENT_NONE),
-    private: UnsafeCell::new(ProcPrivate {
-        sz: 0,
-        trapframe_page: None,
-        pagetable: None,
-        context: Context::ZERO,
-        name: [0; 16],
-    }),
-};
-
 /// The process table (`proc[NPROC]`, proc.c:11). Const-constructed: C's
 /// `procinit` (proc.c:47-59) only initializes locks and kstack values,
-/// both of which are const here.
-static PROCS: [Proc; NPROC] = [PROC_EMPTY; NPROC];
+/// both of which are const here. The inline const creates distinct
+/// interior-mutable cells for every slot.
+static PROCS: [Proc; NPROC] = [const {
+    Proc {
+        shared: SpinLock::new(ProcShared {
+            state: ProcState::Unused,
+            chan: 0,
+            killed: false,
+            xstate: 0,
+            pid: 0,
+        }),
+        parent: UnsafeCell::new(PARENT_NONE),
+        private: UnsafeCell::new(ProcPrivate {
+            sz: 0,
+            trapframe_page: None,
+            pagetable: None,
+            context: Context::ZERO,
+            name: [0; 16],
+        }),
+    }
+}; NPROC];
 
 /// A token for the process running on this hart (`myproc`, proc.c:82-90).
 /// Existing is proof that `cpu::current()` names this slot; its methods
@@ -262,7 +260,7 @@ impl CurrentProc {
     fn context_ptr(&self) -> *mut Context {
         // SAFETY: as `sz`; the address is only dereferenced by `swtch`
         // under the scheduler discipline.
-        unsafe { core::ptr::addr_of_mut!((*private_mut(self.proc())).context) }
+        unsafe { core::ptr::addr_of_mut!(private_mut(self.proc()).context) }
     }
 
     /// The name bytes (for fork's copy and diagnostics).
@@ -306,9 +304,9 @@ unsafe fn private(p: &Proc) -> &ProcPrivate {
     unsafe { &*p.private.get() }
 }
 /// Mutate a slot's private fields. Same contract as [`private`].
-unsafe fn private_mut(p: &Proc) -> &mut ProcPrivate {
-    // SAFETY: caller contract of `private`.
-    unsafe { &mut *p.private.get() }
+unsafe fn private_mut(p: *const Proc) -> &'static mut ProcPrivate {
+    // SAFETY: caller contract of `private`; `p` points into static PROCS.
+    unsafe { &mut *(*p).private.get() }
 }
 
 /// Read a slot's parent (under [`WAIT_LOCK`]).
@@ -342,8 +340,8 @@ fn allocpid() -> i32 {
 /// held (`allocproc`, proc.c:105-150). `None` when the table is full or
 /// a memory allocation fails.
 fn allocproc() -> Option<(usize, SpinGuard<'static, ProcShared>)> {
-    for slot in 0..NPROC {
-        let mut shared = PROCS[slot].shared.lock();
+    for (slot, proc) in PROCS.iter().enumerate() {
+        let mut shared = proc.shared.lock();
         if shared.state != ProcState::Unused {
             drop(shared);
             continue;
@@ -358,7 +356,7 @@ fn allocproc() -> Option<(usize, SpinGuard<'static, ProcShared>)> {
         };
         // SAFETY: we hold this slot's shared lock with state Used —
         // the alloc path's sanctioned private access.
-        let private = unsafe { private_mut(&PROCS[slot]) };
+        let private = unsafe { private_mut(proc) };
         private.trapframe_page = Some(frame);
 
         // An empty user page table with trampoline and trapframe
@@ -403,7 +401,12 @@ fn proc_pagetable(trapframe_pa: PhysAddr) -> Option<PageTable> {
 
     // Map the trapframe page just below the trampoline (proc.c:195-202).
     if pt
-        .map_range(VirtAddr(TRAPFRAME.0), trapframe_pa, PAGE_SIZE as u64, Perm::R | Perm::W)
+        .map_range(
+            VirtAddr(TRAPFRAME.0),
+            trapframe_pa,
+            PAGE_SIZE as u64,
+            Perm::R | Perm::W,
+        )
         .is_err()
     {
         // Unmap the trampoline so the Drop-time freewalk finds no leaf,
@@ -450,8 +453,8 @@ pub fn scheduler() -> ! {
         arch::intr_off();
 
         let mut found = false;
-        for slot in 0..NPROC {
-            let mut shared = PROCS[slot].shared.lock();
+        for (slot, proc) in PROCS.iter().enumerate() {
+            let mut shared = proc.shared.lock();
             if shared.state != ProcState::Runnable {
                 drop(shared);
                 continue;
@@ -469,10 +472,7 @@ pub fn scheduler() -> ! {
             // cell and slot `slot`'s private cell, both valid across
             // the switch and distinct.
             unsafe {
-                arch::switch(
-                    c.scheduler_context(),
-                    context_ptr_of(slot),
-                );
+                arch::switch(c.scheduler_context(), context_ptr_of(slot));
             }
             // Don't re-enable interrupts on release (proc.c:455-456).
             c.set_intena(false);
@@ -482,7 +482,7 @@ pub fn scheduler() -> ! {
             found = true;
             // Release what we acquired before the switch; the process
             // kept it held on this hart the whole time it ran.
-            PROCS[slot].shared.release_raw();
+            proc.shared.release_raw();
         }
         if !found {
             // Nothing to run; stop until an interrupt (proc.c:465-468).
@@ -496,7 +496,7 @@ fn context_ptr_of(slot: usize) -> *mut Context {
     // SAFETY: only the scheduler (or sched on the running process)
     // reaches this, under the slot's shared lock held — state
     // transitions are serialized.
-    unsafe { core::ptr::addr_of_mut!((*private_mut(&PROCS[slot])).context) }
+    unsafe { core::ptr::addr_of_mut!(private_mut(&PROCS[slot]).context) }
 }
 
 /// Switch to the scheduler (`sched`, proc.c:472-497). Must hold only the
@@ -519,7 +519,7 @@ fn sched(p: &CurrentProc) {
     unsafe {
         arch::switch(p.context_ptr(), c.scheduler_context());
     }
-    c.set_intena(intena);
+    cpu::current().set_intena(intena);
 }
 
 /// Give up the hart for one scheduling round (`yield`, proc.c:499-508).
@@ -568,37 +568,45 @@ pub fn sleep<T: Send>(chan: usize, guard: SpinGuard<'_, T>) -> SpinGuard<'_, T> 
     lk.lock()
 }
 
-/// Sleep on `chan` with no condition lock — the fused form of this
-/// reference's `sleep_prepare(chan)` + `sleep()` pair (proc.c:548-573),
-/// for conditions that are hardware state no kernel lock protects (the
-/// uart transmitter's LSR_TX_IDLE, uart.c:83-96). `wakeup(chan)` is the
-/// wake side.
-pub fn sleep0(chan: usize) {
-    let p = my_proc().expect("sleep0: no current proc");
-    assert!(chan != 0, "sleep0: zero chan");
-
+/// Register the current process as waiting for wakeups on `chan`
+/// (`sleep_prepare`, proc.c:546-557). A wakeup between this call and
+/// [`sleep_commit`] clears the channel, so the process will not sleep.
+pub fn sleep_prepare(chan: usize) {
+    let p = my_proc().expect("sleep_prepare: no current proc");
     let mut shared = p.shared().lock();
+    assert!(chan != 0, "sleep_prepare: zero chan");
     shared.chan = chan;
+}
+
+/// Sleep after [`sleep_prepare`] unless a wakeup has already cleared the
+/// registered channel (`sleep`, proc.c:559-573).
+pub fn sleep_commit() {
+    let p = my_proc().expect("sleep_commit: no current proc");
+    let mut shared = p.shared().lock();
+    if shared.chan == 0 {
+        return;
+    }
+
     shared.state = ProcState::Sleeping;
     mem::forget(shared);
     sched(&p);
 
-    p.shared().with_held(|shared| shared.chan = 0);
+    // The scheduler that resumed us holds p.shared on this hart.
     p.shared().release_raw();
 }
 
-/// Wake all processes sleeping on `chan` (`wakeup`, proc.c:575-596):
-/// every slot's `shared` lock in turn; a matching channel makes the
-/// process runnable. (This reference also clears `chan` there; with the
-/// fused sleep above, the sleeper clears it on wake instead — the same
-/// lost-wakeup guarantee, upstream xv6's split.)
+/// Wake all processes waiting on `chan` (`wakeup`, proc.c:575-596).
+/// Clearing `chan` also signals a process that has prepared but not yet
+/// committed its sleep; an already sleeping process becomes runnable.
 pub fn wakeup(chan: usize) {
-    for slot in 0..NPROC {
-        let mut shared = PROCS[slot].shared.lock();
-        if shared.chan == chan && shared.state == ProcState::Sleeping {
-            shared.state = ProcState::Runnable;
+    for proc in &PROCS {
+        let mut shared = proc.shared.lock();
+        if shared.chan == chan {
+            shared.chan = 0;
+            if shared.state == ProcState::Sleeping {
+                shared.state = ProcState::Runnable;
+            }
         }
-        drop(shared);
     }
 }
 
@@ -662,10 +670,7 @@ fn reparent(slot: usize, _wl: &SpinGuard<'_, ()>) {
 /// An exited process stays zombie until its parent calls [`wait`].
 pub fn exit(status: i32) -> ! {
     let p = my_proc().expect("exit: no current proc");
-    assert!(
-        p.slot() != INITPROC.load(Ordering::Relaxed),
-        "init exiting"
-    );
+    assert!(p.slot() != INITPROC.load(Ordering::Relaxed), "init exiting");
 
     // Close all open files and the cwd (proc.c:333-345): joins with the
     // file table (M5); there is nothing to close before then.
@@ -699,12 +704,12 @@ pub fn wait(status_addr: u64) -> Result<usize, Err> {
     loop {
         // Scan the table for exited children (proc.c:380-405).
         let mut havekids = false;
-        for slot in 0..NPROC {
+        for (slot, proc) in PROCS.iter().enumerate() {
             if parent_slot(slot) != Some(p.slot()) {
                 continue;
             }
             // Make sure the child isn't still in exit or swtch.
-            let mut shared = PROCS[slot].shared.lock();
+            let mut shared = proc.shared.lock();
             havekids = true;
             if shared.state == ProcState::Zombie {
                 let pid = shared.pid;
@@ -739,8 +744,8 @@ pub fn wait(status_addr: u64) -> Result<usize, Err> {
 /// victim won't exit until it tries to return to user space (see
 /// `usertrap`).
 pub fn kill(pid: i32) -> Result<(), Err> {
-    for slot in 0..NPROC {
-        let mut shared = PROCS[slot].shared.lock();
+    for proc in &PROCS {
+        let mut shared = proc.shared.lock();
         if shared.pid == pid {
             shared.killed = true;
             if shared.state == ProcState::Sleeping {
@@ -779,7 +784,11 @@ pub fn either_copy_in(dst: &mut [u8], user_src: bool, srcva: u64) -> Result<(), 
         // SAFETY: as `either_copy_out` — a kernel source the caller
         // owns for `dst.len()` bytes.
         unsafe {
-            core::ptr::copy_nonoverlapping(srcva as usize as *const u8, dst.as_mut_ptr(), dst.len());
+            core::ptr::copy_nonoverlapping(
+                srcva as usize as *const u8,
+                dst.as_mut_ptr(),
+                dst.len(),
+            );
         }
         Ok(())
     } else {
@@ -809,8 +818,8 @@ extern "C" fn forkret() {
 /// left to help).
 pub fn procdump() {
     println!();
-    for slot in 0..NPROC {
-        let shared = PROCS[slot].shared.lock();
+    for proc in &PROCS {
+        let shared = proc.shared.lock();
         if shared.state == ProcState::Unused {
             continue;
         }
@@ -825,7 +834,7 @@ pub fn procdump() {
         // SAFETY: diagnostic read of bytes that only fork/alloc write
         // under the shared lock we hold; a torn value is garbage text,
         // never invalid memory.
-        let name = unsafe { private(&PROCS[slot]) }.name;
+        let name = unsafe { private(proc) }.name;
         let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
         println!("{} {} {}", shared.pid, state, as_str(&name[..end]));
     }

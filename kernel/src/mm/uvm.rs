@@ -4,10 +4,10 @@
 //! addresses below `p->sz`. The per-page loops, failure rollbacks, and
 //! the page-boundary-chunked copies are ported exactly from C.
 
-use crate::arch::{PageTable, Perm, TRAPFRAME, TRAMPOLINE};
 use crate::arch::PAGE_SIZE;
+use crate::arch::{PageTable, Perm, TRAMPOLINE, TRAPFRAME};
 use crate::err::Err;
-use crate::mm::addr::{page_round_up, PhysAddr, VirtAddr};
+use crate::mm::addr::{PhysAddr, VirtAddr, page_round_up};
 use crate::mm::frame::PhysFrame;
 use crate::mm::kalloc;
 
@@ -83,7 +83,10 @@ pub fn copy(old: &PageTable, new: &mut PageTable, sz: u64) -> Result<(), Err> {
             return Err(Err::NoMem);
         };
         copy_page(pa, frame.addr());
-        if new.map_range(VirtAddr(i), frame.addr(), PAGE, perm).is_err() {
+        if new
+            .map_range(VirtAddr(i), frame.addr(), PAGE, perm)
+            .is_err()
+        {
             // The frame drops here (vm.c:321's kfree); unwind.
             unmap_range(new, 0, (i / PAGE) as usize, true);
             return Err(Err::NoMem);
@@ -139,23 +142,21 @@ pub fn free_proc_table(mut pt: PageTable, sz: u64) {
 /// Remove `npages` of mappings starting at `va`, optionally freeing the
 /// physical pages (`uvmunmap`, vm.c:194-213). Missing mappings are fine.
 pub fn unmap_range(pt: &mut PageTable, va: u64, npages: usize, do_free: bool) {
-    assert!(va % PAGE == 0, "uvmunmap: not aligned");
+    assert!(va.is_multiple_of(PAGE), "uvmunmap: not aligned");
     for i in 0..npages {
         let a = va + i as u64 * PAGE;
-        if let Some(pa) = pt.take_leaf(a) {
-            if do_free {
-                drop(PhysFrame::from_raw(pa));
-            }
+        if let Some(pa) = pt.take_leaf(a)
+            && do_free
+        {
+            drop(PhysFrame::from_raw(pa));
         }
     }
 }
-
 /// Look up a user virtual address, returning the physical address
 /// (`walkaddr`, vm.c:122-139): requires a valid, user-accessible leaf.
 pub fn walkaddr(pt: &PageTable, va: u64) -> Option<PhysAddr> {
     pt.walkaddr(va)
 }
-
 
 /// Copy from user to kernel (`copyin`, vm.c:383-405 minus this
 /// reference's `vmfault` fallback, which belongs to the lazy-sbrk
@@ -173,7 +174,11 @@ pub fn copy_in(pt: &PageTable, dst: &mut [u8], mut srcva: u64) -> Result<(), Err
         // here. No alias exists because kernel buffers are never mapped
         // into user space.
         unsafe {
-            core::ptr::copy_nonoverlapping((pa0.0 + srcva - va0) as usize as *const u8, dst.as_mut_ptr(), n);
+            core::ptr::copy_nonoverlapping(
+                (pa0.0 + srcva - va0) as usize as *const u8,
+                dst.as_mut_ptr(),
+                n,
+            );
         }
         dst = &mut dst[n..];
         srcva = va0 + PAGE;
@@ -226,6 +231,10 @@ fn copy_page(src: PhysAddr, dst: PhysAddr) {
     // the parent's table (process-private memory) and `dst` is fresh
     // from kalloc — and the kernel identity map covers both.
     unsafe {
-        core::ptr::copy_nonoverlapping(src.0 as usize as *const u8, dst.0 as usize as *mut u8, PAGE_SIZE);
+        core::ptr::copy_nonoverlapping(
+            src.0 as usize as *const u8,
+            dst.0 as usize as *mut u8,
+            PAGE_SIZE,
+        );
     }
 }

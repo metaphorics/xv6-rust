@@ -6,8 +6,8 @@
 
 use core::arch::asm;
 
-use crate::arch::PAGE_SIZE;
-use crate::mm::addr::{px, PhysAddr, VirtAddr};
+use crate::arch::{KSTACK_PAGES, PAGE_SIZE};
+use crate::mm::addr::{PhysAddr, VirtAddr, px};
 use crate::mm::frame::PhysFrame;
 use crate::mm::kalloc;
 
@@ -16,7 +16,7 @@ const PTE_V: u64 = 1 << 0;
 const PTE_R: u64 = 1 << 1;
 const PTE_W: u64 = 1 << 2;
 const PTE_X: u64 = 1 << 3;
-const PTE_U: u64 = 1 << 8;
+const PTE_U: u64 = 1 << 4;
 
 /// SATP mode for Sv39 (riscv.h:246).
 const SATP_SV39: u64 = 8 << 60;
@@ -32,10 +32,11 @@ pub const TRAMPOLINE: VirtAddr = VirtAddr(MAXVA - PAGE_SIZE as u64);
 /// (`TRAPFRAME = TRAMPOLINE - PGSIZE`, memlayout.h:60).
 pub const TRAPFRAME: VirtAddr = VirtAddr(TRAMPOLINE.0 - PAGE_SIZE as u64);
 
-/// Virtual address of process `p`'s kernel stack; each is followed by an
-/// unmapped guard page (`KSTACK(p)`, memlayout.h:52).
+/// Virtual address of process `p`'s kernel stack. Each stack has
+/// [`KSTACK_PAGES`] usable pages, separated by an unmapped guard page.
 pub const fn kstack(p: usize) -> VirtAddr {
-    VirtAddr(TRAMPOLINE.0 - 2 * (p as u64 + 1) * PAGE_SIZE as u64)
+    let stride = (KSTACK_PAGES + 1) as u64 * PAGE_SIZE as u64;
+    VirtAddr(TRAMPOLINE.0 - (p as u64 + 1) * stride)
 }
 
 /// Page permissions: the arch-neutral bit set of the seam, encoded here
@@ -127,10 +128,10 @@ impl PageTable {
         perm: Perm,
     ) -> Result<(), ()> {
         let page = PAGE_SIZE as u64;
-        if va.0 % page != 0 {
+        if !va.0.is_multiple_of(page) {
             panic!("mappages: va not aligned");
         }
-        if size % page != 0 {
+        if !size.is_multiple_of(page) {
             panic!("mappages: size not aligned");
         }
         if size == 0 {
@@ -186,6 +187,7 @@ impl PageTable {
         if pte & PTE_V == 0 {
             return None;
         }
+        // SAFETY: same slot and ownership invariant as the read above.
         unsafe { *slot = 0 };
         Some(PhysAddr(pte2pa(pte)))
     }
@@ -201,6 +203,9 @@ impl PageTable {
     /// with PTE_U. `None` if unmapped or not user-accessible. Can only
     /// be used to look up user pages.
     pub fn walkaddr(&self, va: u64) -> Option<PhysAddr> {
+        if va >= MAXVA {
+            return None;
+        }
         let pte = self.leaf_pte(va)?;
         (pte & PTE_U != 0).then_some(PhysAddr(pte2pa(pte)))
     }
@@ -293,6 +298,7 @@ fn table_of(pa: PhysAddr) -> *mut [u64; 512] {
 /// tree, whose pages were handed over by `PhysFrame::leak` (exclusive
 /// ownership moved into the tree) and are touched nowhere else; `i < 512`.
 fn pte_read(table: *mut [u64; 512], i: usize) -> u64 {
+    // SAFETY: caller contract above.
     unsafe { (*table)[i] }
 }
 
@@ -300,6 +306,7 @@ fn pte_read(table: *mut [u64; 512], i: usize) -> u64 {
 ///
 /// SAFETY: as `pte_read` — exclusive page ownership by the tree.
 fn pte_write(table: *mut [u64; 512], i: usize, pte: u64) {
+    // SAFETY: caller contract above.
     unsafe { (*table)[i] = pte }
 }
 

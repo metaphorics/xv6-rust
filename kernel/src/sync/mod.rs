@@ -8,4 +8,4 @@ mod sleeplock;
 mod spin;
 
 pub use sleeplock::SleepLock;
-pub use spin::{pop_off, push_off, SpinGuard, SpinLock};
+pub use spin::{SpinGuard, SpinLock, pop_off, push_off};

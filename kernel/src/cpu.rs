@@ -42,14 +42,14 @@ pub struct Cpu {
 // discipline.
 unsafe impl Sync for Cpu {}
 
-const CPU_INIT: Cpu = Cpu {
-    noff: AtomicI32::new(0),
-    intena: AtomicBool::new(false),
-    current: AtomicUsize::new(0),
-    context: UnsafeCell::new(Context::ZERO),
-};
-
-static CPUS: [Cpu; NCPU] = [CPU_INIT; NCPU];
+static CPUS: [Cpu; NCPU] = [const {
+    Cpu {
+        noff: AtomicI32::new(0),
+        intena: AtomicBool::new(false),
+        current: AtomicUsize::new(0),
+        context: UnsafeCell::new(Context::ZERO),
+    }
+}; NCPU];
 
 /// The calling hart's row. Must run with interrupts disabled: otherwise a
 /// timer interrupt between reading `cpu_id()` and using the result could
@@ -82,12 +82,13 @@ impl Cpu {
     /// The process running on this hart, if any (`c->proc`).
     pub fn current_slot(&self) -> Option<usize> {
         let slot = self.current.load(Ordering::Relaxed);
-        (slot != 0).then_some(slot - 1)
+        if slot == 0 { None } else { Some(slot - 1) }
     }
 
     /// Set or clear the running process (`c->proc = p`, proc.c:434/452).
     pub fn set_current_slot(&self, slot: Option<usize>) {
-        self.current.store(slot.map_or(0, |s| s + 1), Ordering::Relaxed);
+        self.current
+            .store(slot.map_or(0, |s| s + 1), Ordering::Relaxed);
     }
 
     /// The scheduler context's address, as `swtch` wants it

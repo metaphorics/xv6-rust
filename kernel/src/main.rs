@@ -47,6 +47,7 @@ extern "C" fn main(hartid: usize) -> ! {
         mm::kernel_map::activate_hart(); // turn on paging (main.c:39)
         trap::init_hart(); // install kernel trap vector (main.c:40)
         intr::init_hart(hartid); // ask PLIC for device interrupts (main.c:41)
+        arch::intr_on();
         proc::scheduler(); // run processes (main.c:44)
     }
 

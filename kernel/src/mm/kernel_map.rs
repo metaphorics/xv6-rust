@@ -11,7 +11,7 @@ use super::addr::{PhysAddr, VirtAddr};
 use super::kalloc;
 use super::layout::{KERNBASE, PHYSTOP, PLIC, PLIC_SIZE, UART0, VIRTIO0};
 use crate::arch::riscv64::trampoline;
-use crate::arch::{self, kstack, PageTable, Perm, TRAMPOLINE};
+use crate::arch::{self, KSTACK_PAGES, PageTable, Perm, TRAMPOLINE, kstack};
 use crate::params::NPROC;
 
 unsafe extern "C" {
@@ -34,10 +34,22 @@ pub fn init() {
     kvmmap(&mut pt, VirtAddr(UART0.0), UART0, PAGE, Perm::R | Perm::W);
 
     // virtio mmio disk interface (vm.c:33).
-    kvmmap(&mut pt, VirtAddr(VIRTIO0.0), VIRTIO0, PAGE, Perm::R | Perm::W);
+    kvmmap(
+        &mut pt,
+        VirtAddr(VIRTIO0.0),
+        VIRTIO0,
+        PAGE,
+        Perm::R | Perm::W,
+    );
 
     // PLIC (vm.c:36).
-    kvmmap(&mut pt, VirtAddr(PLIC.0), PLIC, PLIC_SIZE, Perm::R | Perm::W);
+    kvmmap(
+        &mut pt,
+        VirtAddr(PLIC.0),
+        PLIC,
+        PLIC_SIZE,
+        Perm::R | Perm::W,
+    );
 
     // kernel text, executable and read-only (vm.c:39).
     // SAFETY: `etext` is a linker-provided symbol; only its address is
@@ -70,18 +82,19 @@ pub fn init() {
         PAGE,
         Perm::R | Perm::X,
     );
-
-    // allocate and map a kernel stack for each process, each under an
-    // unmapped guard page (proc_mapstacks, proc.c:33-44).
+    // Allocate and map four usable kernel-stack pages per process, with
+    // one unmapped guard page between adjacent stacks.
     for p in 0..NPROC {
-        let frame = kalloc::alloc().expect("proc_mapstacks: kalloc");
-        kvmmap(
-            &mut pt,
-            kstack(p),
-            frame.leak(),
-            PAGE,
-            Perm::R | Perm::W,
-        );
+        for page in 0..KSTACK_PAGES {
+            let frame = kalloc::alloc().expect("proc_mapstacks: kalloc");
+            kvmmap(
+                &mut pt,
+                VirtAddr(kstack(p).0 + page as u64 * PAGE),
+                frame.leak(),
+                PAGE,
+                Perm::R | Perm::W,
+            );
+        }
     }
 
     KERNEL_ROOT.store(pt.leak_root().0, Ordering::Release);

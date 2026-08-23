@@ -12,10 +12,10 @@
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TrapFrame {
-    /*   0 */ pub kernel_satp: u64,   // kernel page table
-    /*   8 */ pub kernel_sp: u64,     // top of process's kernel stack
-    /*  16 */ pub kernel_trap: u64,   // usertrap()
-    /*  24 */ pub epc: u64,           // saved user program counter
+    /*   0 */ pub kernel_satp: u64, // kernel page table
+    /*   8 */ pub kernel_sp: u64, // top of process's kernel stack
+    /*  16 */ pub kernel_trap: u64, // usertrap()
+    /*  24 */ pub epc: u64, // saved user program counter
     /*  32 */ pub kernel_hartid: u64, // saved kernel tp
     /*  40 */ pub ra: u64,
     /*  48 */ pub sp: u64,

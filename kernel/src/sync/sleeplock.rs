@@ -5,8 +5,6 @@
 //! single `locked` word plus the sleep/wakeup channel protocol
 //! (sleeplock.c:13-57).
 
-
-
 use crate::proc;
 use crate::sync::SpinLock;
 

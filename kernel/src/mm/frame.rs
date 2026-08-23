@@ -19,7 +19,7 @@ impl PhysFrame {
     /// tree being unwound. The `kfree` range checks (kalloc.c:52-54) hold
     /// by construction and are asserted in debug builds.
     pub(crate) fn from_raw(pa: PhysAddr) -> Self {
-        debug_assert!(pa.0 % PAGE_SIZE as u64 == 0, "kfree: unaligned");
+        debug_assert!(pa.0.is_multiple_of(PAGE_SIZE as u64), "kfree: unaligned");
         debug_assert!(pa.0 >= kalloc::kernel_end().0, "kfree: below end");
         debug_assert!(pa.0 < PHYSTOP.0, "kfree: above PHYSTOP");
         PhysFrame { pa }

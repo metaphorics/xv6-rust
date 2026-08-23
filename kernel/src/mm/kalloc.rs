@@ -2,7 +2,7 @@
 //! freelist threaded through the free pages themselves, protected by a
 //! spin lock.
 
-use super::addr::{page_round_up, PhysAddr};
+use super::addr::{PhysAddr, page_round_up};
 use super::frame::PhysFrame;
 use super::layout::PHYSTOP;
 use crate::arch::PAGE_SIZE;

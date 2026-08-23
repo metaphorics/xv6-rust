@@ -7,17 +7,21 @@
 /// Bytes per page (`PGSIZE`, riscv.h:389); 4 KiB on both adapters.
 pub const PAGE_SIZE: usize = 4096;
 
+/// Usable pages in each process's kernel stack. Unmapped guard pages
+/// separate adjacent stacks and the first stack from the trampoline.
+pub const KSTACK_PAGES: usize = 4;
+
 #[cfg(target_arch = "riscv64")]
 pub mod riscv64;
 
 #[cfg(target_arch = "riscv64")]
-pub use riscv64::swtch::{switch, Context};
+pub use riscv64::swtch::{Context, switch};
 
 #[cfg(target_arch = "riscv64")]
 pub use riscv64::trapframe::TrapFrame;
 
 #[cfg(target_arch = "riscv64")]
-pub use riscv64::vm::{activate, kstack, PageTable, Perm, TRAMPOLINE, TRAPFRAME};
+pub use riscv64::vm::{PageTable, Perm, TRAMPOLINE, TRAPFRAME, activate, kstack};
 
 #[cfg(target_arch = "riscv64")]
 pub use riscv64::{cpu_id, intr_get, intr_off, intr_on, wait_for_interrupt};

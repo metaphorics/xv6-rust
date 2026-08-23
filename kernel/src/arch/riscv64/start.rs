@@ -3,7 +3,7 @@
 
 use core::arch::asm;
 
-use super::{r_time, w_stimecmp, TIMER_INTERVAL};
+use super::{TIMER_INTERVAL, r_time, w_stimecmp};
 use crate::main;
 
 // mstatus.MPP: previous privilege mode for mret (riscv.h:14-17).

@@ -1,10 +1,10 @@
 //! Syscall dispatch and argument unpacking (`kernel/syscall.c`).
 
-use abi::Sys;
 use crate::dev::console;
 use crate::err::Err;
 use crate::proc::CurrentProc;
 use crate::sysproc;
+use abi::Sys;
 
 /// Dispatch the current syscall: read the number from a7, run the
 /// handler, store its result in a0 (`syscall`, syscall.c:136-150).
