@@ -90,6 +90,15 @@ fn syscall(number: abi::Sys, args: [usize; 6]) -> isize {
     }
     a0 as isize
 }
+/// Invoke an xv6 syscall with raw register arguments.
+///
+/// # Safety
+/// Pointer-valued arguments must satisfy the selected syscall's ABI. This is
+/// exposed for usertests that deliberately pass invalid addresses to verify
+/// that the kernel rejects them without dereferencing them in supervisor mode.
+pub unsafe fn raw_syscall(number: abi::Sys, args: [usize; 6]) -> isize {
+    syscall(number, args)
+}
 
 fn call(number: abi::Sys, a0: usize, a1: usize, a2: usize) -> isize {
     syscall(number, [a0, a1, a2, 0, 0, 0])
@@ -146,7 +155,11 @@ pub fn getpid() -> i32 {
 }
 
 pub fn sbrk(bytes: isize) -> isize {
-    call(abi::Sys::Sbrk, bytes as usize, 0, 0)
+    call(abi::Sys::Sbrk, bytes as usize, abi::sbrk::EAGER, 0)
+}
+
+pub fn sbrklazy(bytes: isize) -> isize {
+    call(abi::Sys::Sbrk, bytes as usize, abi::sbrk::LAZY, 0)
 }
 
 pub fn pause(ticks: i32) -> i32 {
