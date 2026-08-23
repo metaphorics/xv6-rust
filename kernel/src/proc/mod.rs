@@ -41,11 +41,13 @@ use crate::arch::{
 };
 use crate::cpu;
 use crate::err::Err;
+use crate::fs::file::FileHandle;
+use crate::fs::inode::Inode;
 use crate::mm::addr::{PhysAddr, VirtAddr};
 use crate::mm::frame::PhysFrame;
 use crate::mm::kalloc;
 use crate::mm::uvm;
-use crate::params::NPROC;
+use crate::params::{NOFILE, NPROC};
 use crate::sync::{SpinGuard, SpinLock, pop_off, push_off};
 
 /// Helps ensure that wakeups of `wait()`ing parents are not lost; must
@@ -104,6 +106,10 @@ pub struct ProcPrivate {
     pub context: Context,
     /// Process name, nul-terminated (proc.h:103).
     pub name: [u8; 16],
+    /// Current working directory (`proc.h:102`).
+    pub cwd: Option<Inode>,
+    /// Open-file descriptors (`proc.h:101`).
+    pub ofile: [Option<FileHandle>; NOFILE],
 }
 
 impl ProcPrivate {
@@ -161,6 +167,8 @@ static PROCS: [Proc; NPROC] = [const {
             pagetable: None,
             context: Context::ZERO,
             name: [0; 16],
+            cwd: None,
+            ofile: [const { None }; NOFILE],
         }),
     }
 }; NPROC];
@@ -275,6 +283,31 @@ impl CurrentProc {
     /// The name as a displayable value, up to the first nul.
     pub fn name_str(&self) -> ProcName {
         ProcName(self.name_bytes())
+    }
+
+    pub fn cwd(&self) -> Option<Inode> {
+        // SAFETY: this is the running process's private state.
+        unsafe { private(self.proc()) }.cwd.as_ref().cloned()
+    }
+
+    pub fn set_cwd(&self, cwd: Option<Inode>) {
+        // SAFETY: this is the running process's private state.
+        unsafe { private_mut(self.proc()) }.cwd = cwd;
+    }
+
+    pub fn file(&self, fd: usize) -> Option<FileHandle> {
+        // SAFETY: this is the running process's private descriptor table.
+        unsafe { private(self.proc()) }
+            .ofile
+            .get(fd)
+            .and_then(|file| file.as_ref().cloned())
+    }
+
+    pub fn replace_file(&self, fd: usize, file: Option<FileHandle>) -> Option<FileHandle> {
+        // SAFETY: this is the running process's private descriptor table.
+        let files = &mut unsafe { private_mut(self.proc()) }.ofile;
+        let slot = files.get_mut(fd)?;
+        core::mem::replace(slot, file)
     }
 }
 
@@ -639,6 +672,8 @@ pub fn fork() -> Result<usize, Err> {
     *nprivate.trapframe() = *p.trapframe();
     nprivate.trapframe().set_ret(0);
 
+    nprivate.cwd = p.cwd();
+    nprivate.ofile = core::array::from_fn(|fd| p.file(fd));
     // Increment reference counts on open file descriptors (proc.c:285-
     // 288): the ofile array and cwd join with the file table (M5).
 
@@ -674,7 +709,17 @@ fn reparent(slot: usize, _wl: &SpinGuard<'_, ()>) {
 pub fn exit(status: i32) -> ! {
     let p = my_proc().expect("exit: no current proc");
     assert!(p.slot() != INITPROC.load(Ordering::Relaxed), "init exiting");
+    let cwd = p.cwd();
+    p.set_cwd(None);
+    if let Some(cwd) = cwd {
+        let operation = crate::fs::log::begin_op();
+        drop(cwd);
+        drop(operation);
+    }
 
+    for fd in 0..NOFILE {
+        drop(p.replace_file(fd, None));
+    }
     // Close all open files and the cwd (proc.c:333-345): joins with the
     // file table (M5); there is nothing to close before then.
 
@@ -800,6 +845,21 @@ pub fn either_copy_in(dst: &mut [u8], user_src: bool, srcva: u64) -> Result<(), 
     }
 }
 
+/// Copy to either a user or kernel address (`either_copyout`, proc.c).
+pub fn either_copy_out(src: &[u8], user_dst: bool, dstva: u64) -> Result<(), Err> {
+    if !user_dst {
+        // SAFETY: kernel callers provide writable storage for `src.len()`
+        // bytes; the regions do not overlap.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), dstva as usize as *mut u8, src.len());
+        }
+        Ok(())
+    } else {
+        let p = my_proc().expect("either_copy_out: no current proc");
+        uvm::copy_out(p.pagetable(), dstva, src)
+    }
+}
+
 /// A fork child's first scheduling lands here (`forkret`, proc.c:510-543).
 extern "C" fn forkret() {
     let p = my_proc().expect("forkret: no current proc");
@@ -808,6 +868,7 @@ extern "C" fn forkret() {
 
     if !FS_INITIALIZED.swap(true, Ordering::AcqRel) {
         crate::fs::init();
+        p.set_cwd(Some(crate::fs::inode::get(abi::ROOTDEV, abi::ROOTINO)));
     }
 
     crate::trap::usertrapret(&p);
@@ -874,4 +935,8 @@ pub fn user_init() {
 
     shared.state = ProcState::Runnable;
     drop(shared);
+}
+
+pub fn cwd() -> Option<Inode> {
+    my_proc().and_then(|process| process.cwd())
 }

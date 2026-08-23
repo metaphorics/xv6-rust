@@ -105,6 +105,36 @@ pub fn intr(c: u8) {
     }
 }
 
+/// Read one cooked input line (`consoleread`, console.c:81-127).
+pub fn read(user_dst: bool, mut dst: u64, n: usize) -> Result<usize, crate::err::Err> {
+    let target = n;
+    let mut remaining = n;
+    let mut cons = CONS.lock();
+    while remaining != 0 {
+        while cons.r == cons.w {
+            if crate::proc::my_proc().is_some_and(|process| process.killed()) {
+                return Err(crate::err::Err::BadArg);
+            }
+            cons = crate::proc::sleep(CONS.chan(), cons);
+        }
+        let c = cons.buf[cons.r as usize % INPUT_BUF_SIZE];
+        cons.r += 1;
+        if u32::from(c) == ctrl(b'D') {
+            if remaining < target {
+                cons.r -= 1;
+            }
+            break;
+        }
+        crate::proc::either_copy_out(&[c], user_dst, dst)?;
+        dst += 1;
+        remaining -= 1;
+        if c == b'\n' {
+            break;
+        }
+    }
+    Ok(target - remaining)
+}
+
 /// User `write` system calls to the console arrive here
 /// (`consolewrite`, console.c:60-78): move 32-byte batches from the
 /// caller's buffer and hand them to the uart's blocking writer.

@@ -115,7 +115,7 @@ fn run(arch: &str, echo_test: bool) {
     if echo_test {
         boot_and_echo(qemu, &kernel, &image);
     }
-    boot_and_expect(qemu, &kernel, &image, "hello from user");
+    boot_and_expect(qemu, &kernel, &image, "fs selftest: all layers passed");
 }
 
 /// Build the kernel and return its executable path.
@@ -379,6 +379,7 @@ fn boot_and_expect(qemu: &str, kernel: &Path, image: &Path, expect: &str) -> ! {
     let (mut child, rx) = spawn_qemu(qemu, kernel, image, false);
     wait_for(&mut child, &rx, expect, BOOT_TIMEOUT);
     wait_for(&mut child, &rx, "hello from user", BOOT_TIMEOUT);
+    wait_for(&mut child, &rx, "hello from user", BOOT_TIMEOUT);
     println!("XTASK: ok");
     kill(&mut child);
     std::process::exit(0);
@@ -391,7 +392,13 @@ fn boot_and_expect(qemu: &str, kernel: &Path, image: &Path, expect: &str) -> ! {
 fn boot_and_echo(qemu: &str, kernel: &Path, image: &Path) -> ! {
     let (mut child, rx) = spawn_qemu(qemu, kernel, image, true);
 
-    // The first user write proves scheduler and device interrupts are live.
+    // Storage must initialize before the first user write.
+    wait_for(
+        &mut child,
+        &rx,
+        "fs selftest: all layers passed",
+        BOOT_TIMEOUT,
+    );
     wait_for(&mut child, &rx, "hello from user", BOOT_TIMEOUT);
 
     // Let the boot output drain and every hart reach the scheduler.
