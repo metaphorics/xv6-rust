@@ -33,7 +33,7 @@ pub mod initcode;
 
 use core::cell::UnsafeCell;
 use core::mem;
-use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 use crate::arch::{
     self, Context, KSTACK_PAGES, PAGE_SIZE, PageTable, Perm, TRAMPOLINE, TRAPFRAME, TrapFrame,
@@ -59,6 +59,9 @@ static NEXT_PID: AtomicI32 = AtomicI32::new(1);
 /// The first process's slot, for reparenting (`initproc`, proc.c:13).
 /// `usize::MAX` until [`user_init`] runs.
 static INITPROC: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// File-system initialization runs once in process context because disk I/O
+/// may sleep (`first`, proc.c:516-529).
+static FS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// `parent` value meaning "no parent" (C's null pointer).
 const PARENT_NONE: usize = usize::MAX;
@@ -797,17 +800,16 @@ pub fn either_copy_in(dst: &mut [u8], user_src: bool, srcva: u64) -> Result<(), 
     }
 }
 
-/// A fork child's very first scheduling by `scheduler` lands here
-/// (`forkret`, proc.c:510-517). The reference's first-process special
-/// case (fsinit + exec /init) is replaced by our initcode loop until
-/// exec lands (M6).
+/// A fork child's first scheduling lands here (`forkret`, proc.c:510-543).
 extern "C" fn forkret() {
     let p = my_proc().expect("forkret: no current proc");
-    // Still holding p.shared from scheduler (proc.c:519-520): this hart
-    // acquired it before the switch, so the raw release is sound.
+    // Still holding p.shared from scheduler (proc.c:519-520).
     p.shared().release_raw();
 
-    // Return to user space, mimicking usertrap's return (proc.c:539-543).
+    if !FS_INITIALIZED.swap(true, Ordering::AcqRel) {
+        crate::fs::init();
+    }
+
     crate::trap::usertrapret(&p);
 }
 

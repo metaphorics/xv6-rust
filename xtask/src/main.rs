@@ -110,11 +110,12 @@ fn run(arch: &str, echo_test: bool) {
     }
     let root = workspace_root();
     let kernel = build_kernel(root);
+    let image = build_fs_image(root);
     let qemu = require_qemu();
     if echo_test {
-        boot_and_echo(qemu, &kernel);
+        boot_and_echo(qemu, &kernel, &image);
     }
-    boot_and_expect(qemu, &kernel, "xv6-rust kernel is booting");
+    boot_and_expect(qemu, &kernel, &image, "hello from user");
 }
 
 /// Build the kernel and return its executable path.
@@ -168,6 +169,20 @@ fn build_kernel(root: &Path) -> PathBuf {
     }
 }
 
+/// Build a fresh fs.img with the reference README as its first regular file.
+fn build_fs_image(root: &Path) -> PathBuf {
+    let image = root.join("fs.img");
+    step(
+        "mkfs fs.img",
+        Command::new("cargo")
+            .current_dir(root)
+            .args(["run", "--quiet", "-p", "mkfs", "--"])
+            .arg(&image)
+            .arg(root.join(".references/xv6-riscv/README")),
+    );
+    image
+}
+
 /// Extract a `"field":"value"` string from one JSON line, or `None` when
 /// the field is absent or null. Cargo's messages are emitted by serde_json
 /// with stable member ordering per record type, so this scan is exact
@@ -219,7 +234,12 @@ fn require_qemu() -> &'static str {
 /// Boot `kernel` under QEMU on the `virt` machine, piping stdin when
 /// `interactive`. Returns the child plus a channel carrying each line of
 /// serial output as it arrives.
-fn spawn_qemu(qemu: &str, kernel: &Path, interactive: bool) -> (Child, mpsc::Receiver<String>) {
+fn spawn_qemu(
+    qemu: &str,
+    kernel: &Path,
+    image: &Path,
+    interactive: bool,
+) -> (Child, mpsc::Receiver<String>) {
     let mut child = match Command::new(qemu)
         .args([
             "-machine",
@@ -231,6 +251,14 @@ fn spawn_qemu(qemu: &str, kernel: &Path, interactive: bool) -> (Child, mpsc::Rec
             "-smp",
             "3",
             "-nographic",
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-drive",
+        ])
+        .arg(format!("file={},if=none,format=raw,id=x0", image.display()))
+        .args([
+            "-device",
+            "virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0",
             "-kernel",
         ])
         .arg(kernel)
@@ -347,9 +375,10 @@ fn wait_for_subsequence(
 /// Boot `kernel` under QEMU and wait for `expect` to appear on the serial
 /// console. Prints QEMU's output as it arrives; exits 0 on match, 1 on
 /// timeout or early exit.
-fn boot_and_expect(qemu: &str, kernel: &Path, expect: &str) -> ! {
-    let (mut child, rx) = spawn_qemu(qemu, kernel, false);
+fn boot_and_expect(qemu: &str, kernel: &Path, image: &Path, expect: &str) -> ! {
+    let (mut child, rx) = spawn_qemu(qemu, kernel, image, false);
     wait_for(&mut child, &rx, expect, BOOT_TIMEOUT);
+    wait_for(&mut child, &rx, "hello from user", BOOT_TIMEOUT);
     println!("XTASK: ok");
     kill(&mut child);
     std::process::exit(0);
@@ -359,8 +388,8 @@ fn boot_and_expect(qemu: &str, kernel: &Path, expect: &str) -> ! {
 /// wait until the first user process is running, send `abc` and expect
 /// its echo, sit out a window of timer ticks, then send `def` and expect
 /// that echo too — proving clock interrupts never wedged the UART hart.
-fn boot_and_echo(qemu: &str, kernel: &Path) -> ! {
-    let (mut child, rx) = spawn_qemu(qemu, kernel, true);
+fn boot_and_echo(qemu: &str, kernel: &Path, image: &Path) -> ! {
+    let (mut child, rx) = spawn_qemu(qemu, kernel, image, true);
 
     // The first user write proves scheduler and device interrupts are live.
     wait_for(&mut child, &rx, "hello from user", BOOT_TIMEOUT);

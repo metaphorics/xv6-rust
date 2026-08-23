@@ -18,6 +18,7 @@ mod arch;
 mod cpu;
 mod dev;
 mod err;
+mod fs;
 mod mm;
 mod params;
 mod proc;
@@ -62,6 +63,7 @@ extern "C" fn main(hartid: usize) -> ! {
     trap::init_hart(); // install kernel trap vector (main.c:24)
     intr::init(); // set up interrupt controller (main.c:25)
     intr::init_hart(0); // ask PLIC for device interrupts (main.c:26)
+    dev::virtio::blk::init(); // emulated hard disk (main.c:30)
     proc::user_init(); // first user process (main.c:30)
 
     BOOT_RELEASE.store(true, Ordering::Release);

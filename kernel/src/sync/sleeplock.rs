@@ -8,13 +8,15 @@
 use crate::proc;
 use crate::sync::SpinLock;
 
-/// A sleep lock (`struct sleeplock`, sleeplock.h:2-10). The reference's
-/// `pid` debug field is cut; nothing reads it.
+/// A sleep lock (`struct sleeplock`, sleeplock.h:2-10). The waiter count
+/// avoids scanning the process table on an uncontended release.
 pub struct SleepLock {
-    /// The `locked` word and its spin lock (`lk` + `locked`,
-    /// sleeplock.h:3-4). Sleeping on the spin lock's own address is the
-    /// channel protocol (`sleep(&lk->locked, &lk->lk)`, sleeplock.c:33).
-    inner: SpinLock<u32>,
+    inner: SpinLock<SleepState>,
+}
+
+struct SleepState {
+    locked: bool,
+    waiters: usize,
 }
 
 impl SleepLock {
@@ -22,7 +24,10 @@ impl SleepLock {
     /// const construction replaces the init call.
     pub const fn new() -> Self {
         SleepLock {
-            inner: SpinLock::new(0),
+            inner: SpinLock::new(SleepState {
+                locked: false,
+                waiters: 0,
+            }),
         }
     }
 
@@ -31,18 +36,24 @@ impl SleepLock {
     /// the waiter sleeps.
     pub fn acquire(&self) {
         let mut guard = self.inner.lock();
-        while *guard != 0 {
+        while guard.locked {
+            guard.waiters += 1;
             guard = proc::sleep(self.inner.chan(), guard);
+            guard.waiters -= 1;
         }
-        *guard = 1;
+        guard.locked = true;
     }
 
     /// Release the lock and wake one waiter (`releasesleep`,
     /// sleeplock.c:44-51).
     pub fn release(&self) {
         let mut guard = self.inner.lock();
-        *guard = 0;
+        assert!(guard.locked, "releasesleep");
+        guard.locked = false;
+        let contested = guard.waiters != 0;
         drop(guard);
-        proc::wakeup(self.inner.chan());
+        if contested {
+            proc::wakeup(self.inner.chan());
+        }
     }
 }

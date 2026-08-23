@@ -211,9 +211,7 @@ fn devintr() -> u32 {
         let irq = intr::claim(hart);
         match irq {
             Some(intr::UART0_IRQ) => uart16550::intr(),
-            // virtio_disk_intr (trap.c:200-201) joins with the disk
-            // driver (M5); an unconfigured virtio device never raises
-            // its IRQ, so this arm reports rather than dispatches.
+            Some(intr::VIRTIO0_IRQ) => crate::dev::virtio::blk::intr(),
             Some(irq) => println!("unexpected interrupt irq={}", irq),
             None => {}
         }
