@@ -317,6 +317,45 @@ impl InodeGuard<'_> {
         done
     }
 
+    pub fn write_user_at(&mut self, src: u64, mut off: u32, n: usize) -> usize {
+        let end = off.checked_add(n as u32);
+        if off > self.metadata().size
+            || end.is_none()
+            || end.is_some_and(|end| end as usize > MAXFILE * BSIZE)
+        {
+            return 0;
+        }
+        let dev = self.inode.dev();
+        let mut done = 0;
+        while done < n {
+            let Some(addr) = block_addr(dev, self.metadata_mut(), off / BSIZE as u32, true) else {
+                break;
+            };
+            let mut block = bcache::bread(dev, addr);
+            let within = off as usize % BSIZE;
+            let amount = (n - done).min(BSIZE - within);
+            let copied = proc::either_copy_in(
+                &mut block.data_mut()[within..within + amount],
+                true,
+                src + done as u64,
+            )
+            .is_ok();
+            // copyin may have changed the beginning of the block before
+            // reaching an invalid user page.
+            log::write(&block);
+            if !copied {
+                break;
+            }
+            done += amount;
+            off += amount as u32;
+        }
+        if off > self.metadata().size {
+            self.metadata_mut().size = off;
+        }
+        self.update();
+        done
+    }
+
     pub fn dir_lookup(&mut self, name: &[u8], offset: Option<&mut u32>) -> Option<Inode> {
         assert_eq!(self.kind(), FileType::Dir as i16, "dirlookup not DIR");
         let wanted = name_bytes(name);

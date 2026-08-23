@@ -170,31 +170,37 @@ impl FileHandle {
                     let mut guard = inode.lock();
                     // Keep the shared offset under the same inode lock as the
                     // write, matching file.c's sharedfd serialization.
-                    let mut off = OFFSETS[self.index].load(Ordering::Relaxed);
-                    let mut written = 0;
-                    let mut buffer = [0; 512];
-                    while written < requested {
-                        let amount = (requested - written).min(buffer.len());
-                        proc::either_copy_in(
-                            &mut buffer[..amount],
-                            user_src,
-                            src + written as u64,
-                        )?;
-                        let accepted = guard.write_at(&buffer[..amount], off);
-                        written += accepted;
-                        off += accepted as u32;
-                        if accepted != amount {
-                            break;
+                    let off = OFFSETS[self.index].load(Ordering::Relaxed);
+                    let written = if user_src {
+                        guard.write_user_at(src, off, requested)
+                    } else {
+                        let mut written = 0;
+                        let mut buffer = [0; 512];
+                        while written < requested {
+                            let amount = (requested - written).min(buffer.len());
+                            proc::either_copy_in(
+                                &mut buffer[..amount],
+                                false,
+                                src + written as u64,
+                            )?;
+                            let accepted = guard.write_at(&buffer[..amount], off + written as u32);
+                            written += accepted;
+                            if accepted != amount {
+                                break;
+                            }
                         }
+                        written
+                    };
+                    if written > 0 {
+                        OFFSETS[self.index].store(off + written as u32, Ordering::Relaxed);
                     }
-                    OFFSETS[self.index].store(off, Ordering::Relaxed);
                     drop(guard);
                     drop(operation);
+                    if written != requested {
+                        return Err(Err::BadArg);
+                    }
                     total += written;
                     src += written as u64;
-                    if written != requested {
-                        break;
-                    }
                 }
                 Ok(total)
             }
