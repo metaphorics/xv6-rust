@@ -29,8 +29,6 @@
 //! [`SpinLock::release_raw`] on a forgotten guard — every use is
 //! paired and documented.
 
-pub mod initcode;
-
 use core::cell::UnsafeCell;
 use core::mem;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
@@ -308,6 +306,41 @@ impl CurrentProc {
         let files = &mut unsafe { private_mut(self.proc()) }.ofile;
         let slot = files.get_mut(fd)?;
         core::mem::replace(slot, file)
+    }
+
+    /// Allocate an empty process page table sharing this process's
+    /// trapframe page. Exec builds a replacement image in this table.
+    pub fn new_exec_pagetable(&self) -> Option<PageTable> {
+        // SAFETY: this is the running process's private trapframe owner.
+        let private = unsafe { private(self.proc()) };
+        let trapframe = private.trapframe_page.as_ref()?.addr();
+        proc_pagetable(trapframe)
+    }
+
+    /// Atomically install a completed exec image, then release the old one.
+    pub fn install_exec(
+        &self,
+        pagetable: PageTable,
+        sz: u64,
+        entry: u64,
+        sp: u64,
+        argv: u64,
+        name: [u8; 16],
+    ) {
+        // SAFETY: this is the running process's private state.
+        let private = unsafe { private_mut(self.proc()) };
+        let old_sz = private.sz;
+        let old = private
+            .pagetable
+            .replace(pagetable)
+            .expect("exec: old pagetable");
+        private.sz = sz;
+        private.name = name;
+        let trapframe = private.trapframe();
+        trapframe.epc = entry;
+        trapframe.sp = sp;
+        trapframe.a1 = argv;
+        uvm::free_proc_table(old, old_sz);
     }
 }
 
@@ -869,6 +902,9 @@ extern "C" fn forkret() {
     if !FS_INITIALIZED.swap(true, Ordering::AcqRel) {
         crate::fs::init();
         p.set_cwd(Some(crate::fs::inode::get(abi::ROOTDEV, abi::ROOTINO)));
+        let argc =
+            crate::exec::exec(b"/init", &[b"/init"]).unwrap_or_else(|_| panic!("exec /init"));
+        p.trapframe().set_ret(argc as u64);
     }
 
     crate::trap::usertrapret(&p);
@@ -903,38 +939,12 @@ pub fn procdump() {
     }
 }
 
-/// Set up the first user process (`userinit`, proc.c:217-227 — this
-/// reference's exec-/init form is replaced by the classic initcode image
-/// until exec lands in M6; see `initcode`). The slot stays holding its
-/// `shared` lock across the body, released at the end.
+/// Allocate the first process. Its first `forkret` initializes the file
+/// system and execs `/init`; no temporary M4 user image remains.
 pub fn user_init() {
     let (slot, mut shared) = allocproc().expect("userinit: allocproc");
     INITPROC.store(slot, Ordering::Release);
-
-    // SAFETY: the slot's shared lock is held with state Used — the
-    // alloc path's sanctioned private access.
-    let private = unsafe { private_mut(&PROCS[slot]) };
-
-    // One page of user memory at va 0 holding the initcode image
-    // (uvminit: map, zero, copy).
-    uvm::init(
-        private.pagetable.as_mut().expect("userinit: pagetable"),
-        &initcode::INITCODE,
-    );
-    private.sz = PAGE_SIZE as u64;
-
-    // User program counter at main, user stack pointer at the page top
-    // (proc.c:222-223).
-    let tf = private.trapframe();
-    tf.epc = 0;
-    tf.sp = PAGE_SIZE as u64;
-
-    private.name = *b"initcode\0\0\0\0\0\0\0\0";
-
-    // cwd = namei("/") joins with the file system (M5).
-
     shared.state = ProcState::Runnable;
-    drop(shared);
 }
 
 pub fn cwd() -> Option<Inode> {

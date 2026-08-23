@@ -23,6 +23,9 @@ dependencies = [
 [[package]]
 name = "user"
 version = "0.1.0"
+dependencies = [
+ "abi",
+]
 
 [[package]]
 name = "xtask"

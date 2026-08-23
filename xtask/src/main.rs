@@ -1,44 +1,29 @@
 #![forbid(unsafe_code)]
 
-//! Workspace orchestration for xv6-rust.
-//!
-//! `cargo xtask check` runs the full static gate: rustfmt, clippy with
-//! `-D warnings` for the host members and for the kernel and user crates on
-//! their default `riscv64gc-unknown-none-elf` target, then the host unit
-//! tests. The kernel and user crates configure their build target in their
-//! own `.cargo/config.toml`, which cargo discovers from the working
-//! directory of the invocation rather than from the manifest, so those two
-//! checks are spawned with the crate directory as the working directory.
-//!
-//! `cargo xtask run --arch riscv64` builds the kernel, boots it under QEMU
-//! (`virt`, `-bios none`), and reports success when the boot banner
-//! appears on the serial console.
+//! Build, static verification, image staging, and QEMU shell smoke tests.
 
-use std::io::Write;
-use std::io::{BufRead, BufReader};
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// How long `run` waits for the expected banner before killing QEMU.
-const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How long the echo test waits for each echoed line.
-const ECHO_TIMEOUT: Duration = Duration::from_secs(5);
+const TIMEOUT: Duration = Duration::from_secs(30);
+const USER_PROGRAMS: [&str; 5] = ["init", "sh", "echo", "ls", "cat"];
+const README_FIRST_LINE: &str =
+    "xv6 is a re-implementation of Dennis Ritchie's and Ken Thompson's Unix";
 
 fn main() {
     let mut args = std::env::args();
     let program = args.next();
-    let subcommand = args.next();
-    let rest: Vec<String> = args.collect();
-    match subcommand.as_deref() {
-        Some("check") if rest.is_empty() => check(),
+    match args.next().as_deref() {
+        Some("check") if args.next().is_none() => check(),
         Some("run") => {
+            let rest: Vec<String> = args.collect();
             let arch = parse_arch(&rest, program.as_deref());
-            let echo_test = rest.iter().any(|arg| arg == "--echo-test");
-            run(&arch, echo_test);
+            run(&arch, rest.iter().any(|arg| arg == "--echo-test"));
         }
         _ => usage(program.as_deref()),
     }
@@ -51,7 +36,7 @@ fn parse_arch(args: &[String], program: Option<&str>) -> String {
         return arch.clone();
     }
     let name = program.unwrap_or("cargo xtask");
-    eprintln!("{name}: 'run' expects an '--arch <riscv64>' argument");
+    eprintln!("{name}: run expects --arch <riscv64>");
     std::process::exit(2);
 }
 
@@ -74,16 +59,28 @@ fn check() {
         ]),
     );
     step(
-        "clippy, kernel on riscv64gc-unknown-none-elf",
+        "clippy, kernel dev",
         Command::new("cargo")
             .current_dir(root.join("kernel"))
             .args(["clippy", "--", "-D", "warnings"]),
     );
     step(
-        "clippy, user on riscv64gc-unknown-none-elf",
+        "kernel release",
+        Command::new("cargo")
+            .current_dir(root.join("kernel"))
+            .args(["build", "--release"]),
+    );
+    step(
+        "clippy, user dev",
         Command::new("cargo")
             .current_dir(root.join("user"))
-            .args(["clippy", "--", "-D", "warnings"]),
+            .args(["clippy", "--bins", "--", "-D", "warnings"]),
+    );
+    step(
+        "user release",
+        Command::new("cargo")
+            .current_dir(root.join("user"))
+            .args(["build", "--release", "--bins"]),
     );
     step(
         "host unit tests",
@@ -93,154 +90,172 @@ fn check() {
     );
 }
 
-/// Build the kernel for its default target and boot it in QEMU.
-///
-/// Without `--echo-test`, wait for the boot banner and exit. With it,
-/// drive the guest console: wait for the interrupts-live banner, send
-/// `abc`, expect the echo, sit out a timer-tick window, then send `def`
-/// and expect that echo too — proving timer interrupts never wedged the
-/// hart that serves the UART.
 fn run(arch: &str, echo_test: bool) {
     if arch != "riscv64" {
-        eprintln!(
-            "xtask: --arch {arch} is not bootable yet; only riscv64 is \
-             implemented (x86_64 arrives with its adapter)"
-        );
+        eprintln!("xtask: only riscv64 is implemented");
         std::process::exit(1);
     }
     let root = workspace_root();
     let kernel = build_kernel(root);
-    let image = build_fs_image(root);
+    let programs = build_user_programs(root);
+    let image = build_fs_image(root, &programs);
     let qemu = require_qemu();
     if echo_test {
-        boot_and_echo(qemu, &kernel, &image);
+        boot_echo_test(qemu, &kernel, &image);
+    } else {
+        boot_shell_smoke(qemu, &kernel, &image);
     }
-    boot_and_expect(qemu, &kernel, &image, "fs selftest: all layers passed");
 }
 
-/// Build the kernel and return its executable path.
-///
-/// The artifact path is taken from cargo's `--message-format=json`
-/// compiler-artifact records rather than guessed, so a `build-dir` /
-/// `target-dir` override cannot send QEMU at a stale ELF.
 fn build_kernel(root: &Path) -> PathBuf {
-    println!("==> cargo build, kernel");
-    let mut child = match Command::new("cargo")
-        .current_dir(root.join("kernel"))
-        .args(["build", "--message-format=json"])
+    println!("==> cargo build --release, kernel");
+    let executables = cargo_executables(
+        Command::new("cargo")
+            .current_dir(root.join("kernel"))
+            .args(["build", "--release", "--message-format=json"]),
+        "kernel build",
+    );
+    executables
+        .into_iter()
+        .find(|path| path.file_name().is_some_and(|name| name == "kernel"))
+        .unwrap_or_else(|| fail("cargo did not report a kernel executable"))
+}
+
+fn build_user_programs(root: &Path) -> Vec<PathBuf> {
+    println!("==> cargo build --release --bins, user");
+    let executables = cargo_executables(
+        Command::new("cargo").current_dir(root.join("user")).args([
+            "build",
+            "--release",
+            "--bins",
+            "--message-format=json",
+        ]),
+        "user build",
+    );
+    USER_PROGRAMS
+        .iter()
+        .map(|name| {
+            let source = executables
+                .iter()
+                .find(|path| path.file_name().is_some_and(|file| file == *name))
+                .unwrap_or_else(|| fail(&format!("cargo did not report user binary {name}")));
+            let staged = root.join("user").join(format!("_{name}"));
+            fs::copy(source, &staged).unwrap_or_else(|err| {
+                fail(&format!("could not stage {}: {err}", staged.display()))
+            });
+            staged
+        })
+        .collect()
+}
+
+fn cargo_executables(command: &mut Command, what: &str) -> Vec<PathBuf> {
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-    {
-        Ok(child) => child,
-        Err(err) => {
-            eprintln!("xtask: could not run cargo: {err}");
-            std::process::exit(1);
-        }
-    };
-    let mut kernel = None;
+        .unwrap_or_else(|err| fail(&format!("could not run cargo: {err}")));
+    let mut executables = Vec::new();
     if let Some(stdout) = child.stdout.take() {
-        for line in BufReader::new(stdout).lines() {
-            let Ok(line) = line else { continue };
-            if let Some(executable) = json_string_field(&line, "executable")
-                && executable.file_name().is_some_and(|name| name == "kernel")
-            {
-                kernel = Some(executable);
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(executable) = json_string_field(&line, "executable") {
+                executables.push(executable);
             }
         }
     }
     match child.wait() {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            eprintln!("xtask: kernel build failed: {status}");
-            std::process::exit(1);
-        }
-        Err(err) => {
-            eprintln!("xtask: could not wait for cargo: {err}");
-            std::process::exit(1);
-        }
-    }
-    match kernel {
-        Some(kernel) => kernel,
-        None => {
-            eprintln!("xtask: cargo did not report a kernel executable");
-            std::process::exit(1);
-        }
+        Ok(status) if status.success() => executables,
+        Ok(status) => fail(&format!("{what} failed: {status}")),
+        Err(err) => fail(&format!("could not wait for cargo: {err}")),
     }
 }
 
-/// Build a fresh fs.img with the reference README as its first regular file.
-fn build_fs_image(root: &Path) -> PathBuf {
+fn build_fs_image(root: &Path, programs: &[PathBuf]) -> PathBuf {
     let image = root.join("fs.img");
-    step(
-        "mkfs fs.img",
-        Command::new("cargo")
-            .current_dir(root)
-            .args(["run", "--quiet", "-p", "mkfs", "--"])
-            .arg(&image)
-            .arg(root.join(".references/xv6-riscv/README")),
-    );
+    let mut command = Command::new("cargo");
+    command
+        .current_dir(root)
+        .args(["run", "--quiet", "-p", "mkfs", "--"])
+        .arg(&image)
+        .arg(root.join(".references/xv6-riscv/README"))
+        .args(programs);
+    step("mkfs fs.img", &mut command);
     image
 }
 
-/// Extract a `"field":"value"` string from one JSON line, or `None` when
-/// the field is absent or null. Cargo's messages are emitted by serde_json
-/// with stable member ordering per record type, so this scan is exact
-/// enough for the artifact records read here.
 fn json_string_field(line: &str, field: &str) -> Option<PathBuf> {
-    let needle = format!("\"{field}\":\"");
-    let start = line.find(&needle)? + needle.len();
-    let rest = &line[start..];
-    let mut end = None;
-    let mut escapes: usize = 0;
-    for (i, b) in rest.bytes().enumerate() {
-        if b == b'\\' {
-            escapes += 1;
-        } else if b == b'"' && escapes.is_multiple_of(2) {
-            end = Some(i);
-            break;
-        } else {
-            escapes = 0;
+    let marker = format!("\"{field}\":\"");
+    let start = line.find(&marker)? + marker.len();
+    let bytes = line.as_bytes();
+    let mut value = String::new();
+    let mut index = start;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => return Some(PathBuf::from(value)),
+            b'\\' if index + 1 < bytes.len() => {
+                index += 1;
+                match bytes[index] {
+                    b'\\' => value.push('\\'),
+                    b'"' => value.push('"'),
+                    b'n' => value.push('\n'),
+                    b'r' => value.push('\r'),
+                    b't' => value.push('\t'),
+                    other => value.push(other as char),
+                }
+            }
+            byte => value.push(byte as char),
         }
+        index += 1;
     }
-    let end = end?;
-    let value = &rest[..end];
-    if value.contains("\\u{") {
-        // Rust-style escaped path (never emitted for cargo artifact paths).
-        return None;
-    }
-    Some(PathBuf::from(
-        value.replace("\\\\", "\\").replace("\\\"", "\""),
-    ))
+    None
 }
 
-/// Fail with an installation hint when QEMU is missing.
 fn require_qemu() -> &'static str {
     let qemu = "qemu-system-riscv64";
-    let found = Command::new(qemu)
+    match Command::new(qemu)
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .is_ok_and(|status| status.success());
-    if !found {
-        eprintln!("xtask: '{qemu}' not found on PATH");
-        eprintln!("       install it first, e.g.: sudo apt-get install -y qemu-system-riscv");
-        std::process::exit(1);
+    {
+        Ok(status) if status.success() => qemu,
+        _ => fail("qemu-system-riscv64 is required"),
     }
-    qemu
 }
 
-/// Boot `kernel` under QEMU on the `virt` machine, piping stdin when
-/// `interactive`. Returns the child plus a channel carrying each line of
-/// serial output as it arrives.
-fn spawn_qemu(
-    qemu: &str,
-    kernel: &Path,
-    image: &Path,
-    interactive: bool,
-) -> (Child, mpsc::Receiver<String>) {
-    let mut child = match Command::new(qemu)
+struct Console {
+    rx: mpsc::Receiver<Vec<u8>>,
+    pending: Vec<u8>,
+}
+
+impl Console {
+    fn wait_for(&mut self, child: &mut Child, expected: &[u8]) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if let Some(at) = find_bytes(&self.pending, expected) {
+                self.pending.drain(..at + expected.len());
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.rx.recv_timeout(remaining) {
+                Ok(chunk) => self.pending.extend_from_slice(&chunk),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    kill(child);
+                    fail(&format!(
+                        "timed out waiting for {:?}",
+                        String::from_utf8_lossy(expected)
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    kill(child);
+                    fail("qemu output ended before the expected console text");
+                }
+            }
+        }
+    }
+}
+
+fn spawn_qemu(qemu: &str, kernel: &Path, image: &Path) -> (Child, Console) {
+    let mut child = Command::new(qemu)
         .args([
             "-machine",
             "virt",
@@ -262,175 +277,93 @@ fn spawn_qemu(
             "-kernel",
         ])
         .arg(kernel)
-        .stdin(if interactive {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-    {
-        Ok(child) => child,
-        Err(err) => {
-            eprintln!("xtask: could not spawn {qemu}: {err}");
-            std::process::exit(1);
-        }
-    };
+        .unwrap_or_else(|err| fail(&format!("could not spawn qemu: {err}")));
 
-    // Echo QEMU's serial output while forwarding each line to the matcher.
-    // The echo deliberately avoids `println!`: if the invoking side closes
-    // our stdout, a panicking print would silently kill this thread and
-    // take the matcher down with it.
-    let (tx, rx) = mpsc::channel::<String>();
-    if let Some(stdout) = child.stdout.take() {
-        thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                match line {
-                    Ok(line) => {
-                        let mut out = std::io::stdout().lock();
-                        let _ = writeln!(out, "{line}");
-                        if tx.send(line).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
+    let (tx, rx) = mpsc::channel();
+    let mut stdout = child.stdout.take().expect("qemu stdout");
+    thread::spawn(move || {
+        let mut buffer = [0; 256];
+        while let Ok(n) = stdout.read(&mut buffer) {
+            if n == 0 {
+                break;
             }
-        });
-    }
-    (child, rx)
-}
-
-/// Wait until a serial line containing `expect` arrives; kill the child
-/// and exit non-zero on timeout or a closed output stream.
-fn wait_for(child: &mut Child, rx: &mpsc::Receiver<String>, expect: &str, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        // `saturating_duration_since` so an expired deadline simply turns
-        // into an immediate `Timeout` below instead of panicking.
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(remaining) {
-            Ok(line) if line.contains(expect) => return,
-            Ok(_) => {}
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                kill(child);
-                eprintln!(
-                    "xtask: timed out after {} s waiting for '{expect}'",
-                    timeout.as_secs()
-                );
-                std::process::exit(1);
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // The reader thread is gone: either QEMU exited or our
-                // own stdout was closed. Kill rather than wait, so a
-                // still-running QEMU cannot wedge the harness.
-                kill(child);
-                eprintln!("xtask: qemu output ended before printing '{expect}'");
-                std::process::exit(1);
+            let chunk = buffer[..n].to_vec();
+            let mut terminal = std::io::stdout().lock();
+            let _ = terminal.write_all(&chunk).and_then(|()| terminal.flush());
+            if tx.send(chunk).is_err() {
+                break;
             }
         }
-    }
+    });
+    (
+        child,
+        Console {
+            rx,
+            pending: Vec::new(),
+        },
+    )
 }
 
-/// Wait for the characters in `expect` in order. Other serial output may
-/// occur between them: M4's init process writes continuously while the
-/// console interrupt handler echoes input.
-fn wait_for_subsequence(
-    child: &mut Child,
-    rx: &mpsc::Receiver<String>,
-    expect: &str,
-    timeout: Duration,
-) {
-    let mut remaining = expect.chars();
-    let mut next = remaining.next();
-    let deadline = Instant::now() + timeout;
-    while next.is_some() {
-        let wait = deadline.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(wait) {
-            Ok(line) => {
-                for ch in line.chars() {
-                    if Some(ch) == next {
-                        next = remaining.next();
-                    }
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                kill(child);
-                eprintln!(
-                    "xtask: timed out after {} s waiting for echo '{expect}'",
-                    timeout.as_secs()
-                );
-                std::process::exit(1);
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                kill(child);
-                eprintln!("xtask: qemu output ended before echoing '{expect}'");
-                std::process::exit(1);
-            }
-        }
-    }
-}
-
-/// Boot `kernel` under QEMU and wait for `expect` to appear on the serial
-/// console. Prints QEMU's output as it arrives; exits 0 on match, 1 on
-/// timeout or early exit.
-fn boot_and_expect(qemu: &str, kernel: &Path, image: &Path, expect: &str) -> ! {
-    let (mut child, rx) = spawn_qemu(qemu, kernel, image, false);
-    wait_for(&mut child, &rx, expect, BOOT_TIMEOUT);
-    wait_for(&mut child, &rx, "hello from user", BOOT_TIMEOUT);
-    wait_for(&mut child, &rx, "hello from user", BOOT_TIMEOUT);
-    println!("XTASK: ok");
-    kill(&mut child);
-    std::process::exit(0);
-}
-
-/// Boot `kernel` and exercise the interrupt-driven console end to end:
-/// wait until the first user process is running, send `abc` and expect
-/// its echo, sit out a window of timer ticks, then send `def` and expect
-/// that echo too — proving clock interrupts never wedged the UART hart.
-fn boot_and_echo(qemu: &str, kernel: &Path, image: &Path) -> ! {
-    let (mut child, rx) = spawn_qemu(qemu, kernel, image, true);
-
-    // Storage must initialize before the first user write.
-    wait_for(
-        &mut child,
-        &rx,
-        "fs selftest: all layers passed",
-        BOOT_TIMEOUT,
-    );
-    wait_for(&mut child, &rx, "hello from user", BOOT_TIMEOUT);
-
-    // Let the boot output drain and every hart reach the scheduler.
-    thread::sleep(Duration::from_millis(500));
-    send(&mut child, "ABC\n");
-    wait_for_subsequence(&mut child, &rx, "ABC", ECHO_TIMEOUT);
-
-    // The liveness window: ~15 timer ticks pass before the second echo.
-    thread::sleep(Duration::from_millis(1500));
-    send(&mut child, "DEF\n");
-    wait_for_subsequence(&mut child, &rx, "DEF", ECHO_TIMEOUT);
-
+fn boot_echo_test(qemu: &str, kernel: &Path, image: &Path) -> ! {
+    let (mut child, mut console) = spawn_qemu(qemu, kernel, image);
+    console.wait_for(&mut child, b"init: starting sh");
+    command(&mut child, &mut console, b"echo hi\n", b"hi\n");
+    console.wait_for(&mut child, b"$ ");
     println!("XTASK: echo ok");
     kill(&mut child);
-    std::process::exit(0);
+    std::process::exit(0)
 }
 
-/// Write one line to the guest console over QEMU's piped stdin.
-fn send(child: &mut Child, text: &str) {
+fn boot_shell_smoke(qemu: &str, kernel: &Path, image: &Path) -> ! {
+    let (mut child, mut console) = spawn_qemu(qemu, kernel, image);
+    console.wait_for(&mut child, b"init: starting sh");
+    command(&mut child, &mut console, b"echo hi\n", b"hi\n");
+
+    send_after_prompt(&mut child, &mut console, b"ls\n");
+    console.wait_for(&mut child, b"ls");
+    console.wait_for(&mut child, b"\n");
+    console.wait_for(&mut child, b"README");
+    console.wait_for(&mut child, b"init");
+    console.wait_for(&mut child, b"sh");
+
+    send_after_prompt(&mut child, &mut console, b"cat README\n");
+    console.wait_for(&mut child, b"cat README");
+    console.wait_for(&mut child, b"\n");
+    console.wait_for(&mut child, README_FIRST_LINE.as_bytes());
+    console.wait_for(&mut child, b"$ ");
+
+    println!("XTASK: shell smoke ok");
+    kill(&mut child);
+    std::process::exit(0)
+}
+
+fn command(child: &mut Child, console: &mut Console, input: &[u8], output: &[u8]) {
+    send_after_prompt(child, console, input);
+    console.wait_for(child, &input[..input.len() - 1]);
+    console.wait_for(child, b"\n");
+    console.wait_for(child, output);
+}
+
+fn send_after_prompt(child: &mut Child, console: &mut Console, input: &[u8]) {
+    console.wait_for(child, b"$ ");
     let Some(stdin) = child.stdin.as_mut() else {
         kill(child);
-        eprintln!("xtask: qemu stdin is not piped");
-        std::process::exit(1);
+        fail("qemu stdin is not piped");
     };
-    if let Err(err) = stdin
-        .write_all(text.as_bytes())
+    stdin
+        .write_all(input)
         .and_then(|()| stdin.flush())
-    {
-        kill(child);
-        eprintln!("xtask: could not write to qemu stdin: {err}");
-        std::process::exit(1);
-    }
+        .unwrap_or_else(|err| fail(&format!("could not write qemu stdin: {err}")));
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn kill(child: &mut Child) {
@@ -438,38 +371,27 @@ fn kill(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Run one step of the gate, exiting non-zero with a clear message on
-/// failure.
-fn step(what: &str, cmd: &mut Command) {
+fn step(what: &str, command: &mut Command) {
     println!("==> {what}");
-    match cmd.status() {
+    match command.status() {
         Ok(status) if status.success() => {}
-        Ok(status) => {
-            eprintln!("xtask: step '{what}' failed: {status}");
-            std::process::exit(1);
-        }
-        Err(err) => {
-            eprintln!("xtask: could not run step '{what}': {err}");
-            std::process::exit(1);
-        }
+        Ok(status) => fail(&format!("step {what:?} failed: {status}")),
+        Err(err) => fail(&format!("could not run step {what:?}: {err}")),
     }
+}
+
+fn fail(message: &str) -> ! {
+    eprintln!("xtask: {message}");
+    std::process::exit(1)
 }
 
 fn usage(program: Option<&str>) -> ! {
     let name = program.unwrap_or("cargo xtask");
-    eprintln!("usage: {name} <check>");
-    eprintln!("       {name} run --arch <riscv64> [--echo-test]");
-    eprintln!();
-    eprintln!("subcommands:");
-    eprintln!("  check  rustfmt, clippy -D warnings (host + riscv64gc targets), host tests");
-    eprintln!("  run    build the kernel and boot it in QEMU until the banner appears");
-    eprintln!("         --echo-test: also send abc/def and expect the console echo back,");
-    eprintln!("         proving uart + timer interrupts stay live");
-    std::process::exit(2);
+    eprintln!("usage: {name} check");
+    eprintln!("       {name} run --arch riscv64 [--echo-test]");
+    std::process::exit(2)
 }
 
-/// The workspace root, derived from this crate's location so the steps work
-/// regardless of the invocation directory.
 fn workspace_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

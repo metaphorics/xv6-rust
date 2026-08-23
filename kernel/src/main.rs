@@ -18,12 +18,14 @@ mod arch;
 mod cpu;
 mod dev;
 mod err;
+mod exec;
 mod fs;
 mod mm;
 mod params;
 mod proc;
 mod sync;
 mod syscall;
+mod sysfile;
 mod sysproc;
 mod trap;
 

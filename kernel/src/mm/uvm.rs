@@ -97,27 +97,6 @@ pub fn copy(old: &PageTable, new: &mut PageTable, sz: u64) -> Result<(), Err> {
     Ok(())
 }
 
-/// Map `code` at virtual address 0 in a fresh one-page user image
-/// (`uvminit`, upstream proc.c): one page, RWX|U, bytes copied in.
-/// This reference execs /init instead; our M4 initcode uses the classic
-/// shape (see the milestone report).
-pub fn init(pt: &mut PageTable, code: &[u8]) {
-    assert!(code.len() < PAGE as usize, "uvminit: more than a page");
-    let Some(frame) = kalloc::alloc() else {
-        panic!("uvminit: kalloc");
-    };
-    zero_page(frame.addr());
-    let pa = frame.addr();
-    // SAFETY: the frame is exclusively owned by this call between
-    // `kalloc` and the mapping handoff below; nothing can alias it.
-    unsafe {
-        core::ptr::copy_nonoverlapping(code.as_ptr(), pa.0 as usize as *mut u8, code.len());
-    }
-    pt.map_range(VirtAddr(0), pa, PAGE, Perm::R | Perm::W | Perm::X | Perm::U)
-        .expect("uvminit: mappages");
-    frame.leak();
-}
-
 /// Free user memory pages, then the page-table pages (`uvmfree`,
 /// vm.c:285-290). Consumes the table: its `Drop` runs the `freewalk`
 /// half, which panics if any leaf mapping remains — call sites must
@@ -157,6 +136,11 @@ pub fn unmap_range(pt: &mut PageTable, va: u64, npages: usize, do_free: bool) {
 pub fn walkaddr(pt: &PageTable, va: u64) -> Option<PhysAddr> {
     pt.walkaddr(va)
 }
+/// Make one mapped page supervisor-only (`uvmclear`, vm.c:292-298).
+/// Exec uses this for the stack guard page.
+pub fn clear(pt: &mut PageTable, va: u64) {
+    pt.clear_user(va);
+}
 
 /// Copy from user to kernel (`copyin`, vm.c:383-405 minus this
 /// reference's `vmfault` fallback, which belongs to the lazy-sbrk
@@ -184,6 +168,34 @@ pub fn copy_in(pt: &PageTable, dst: &mut [u8], mut srcva: u64) -> Result<(), Err
         srcva = va0 + PAGE;
     }
     Ok(())
+}
+/// Copy a nul-terminated string from user memory (`copyinstr`,
+/// vm.c:410-452). Returns the byte count including the terminating nul.
+/// Fails if no nul appears before `dst` is full or a page is unmapped.
+pub fn copy_instr(pt: &PageTable, dst: &mut [u8], mut srcva: u64) -> Result<usize, Err> {
+    let mut copied = 0;
+    while copied < dst.len() {
+        let va0 = srcva & !(PAGE - 1);
+        let pa0 = walkaddr(pt, va0).ok_or(Err::BadArg)?;
+        let mut n = ((PAGE - (srcva - va0)) as usize).min(dst.len() - copied);
+        let mut src = (pa0.0 + srcva - va0) as usize as *const u8;
+        while n > 0 {
+            // SAFETY: `pa0` is a user-accessible mapped page pinned by
+            // `pt`; the loop stays within that page.
+            let byte = unsafe { src.read() };
+            dst[copied] = byte;
+            copied += 1;
+            if byte == 0 {
+                return Ok(copied);
+            }
+            // SAFETY: advancing a raw pointer within the validated page
+            // does not dereference it.
+            src = unsafe { src.add(1) };
+            n -= 1;
+        }
+        srcva = va0 + PAGE;
+    }
+    Err(Err::BadArg)
 }
 
 /// Copy from kernel to user (`copyout`, vm.c:345-377): page-chunked,

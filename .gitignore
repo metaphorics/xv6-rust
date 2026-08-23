@@ -8,6 +8,7 @@ fs.img
 *.asm
 *.sym
 .gdbinit
+/user/_*
 
 # === AI TOOLING ===
 .agent-tasks/

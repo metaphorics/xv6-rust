@@ -172,6 +172,17 @@ impl PageTable {
         let pte = unsafe { *pte };
         (pte & PTE_V != 0).then_some(pte)
     }
+    /// Clear user access on an existing leaf mapping (`uvmclear`,
+    /// vm.c:292-298). The mapping stays valid for supervisor access.
+    pub fn clear_user(&mut self, va: u64) {
+        let slot = walk(self.root, va, false).expect("uvmclear");
+        // SAFETY: `walk` returned the leaf PTE slot inside this table,
+        // exclusively reached through `&mut self`.
+        unsafe {
+            assert!(*slot & PTE_V != 0, "uvmclear");
+            *slot &= !PTE_U;
+        }
+    }
 
     /// Remove the leaf mapping for `va`, returning the physical address
     /// it referred to (`*pte = 0` in uvmunmap, vm.c:211-212). `None` if

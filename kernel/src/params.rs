@@ -16,3 +16,11 @@ pub const NINODE: usize = 50;
 pub const NFILE: usize = 100;
 /// Per-process open-file descriptors (`param.h:4`).
 pub const NOFILE: usize = 16;
+/// Maximum argument count accepted by exec (`param.h:8`).
+pub const MAXARG: usize = 32;
+/// Maximum path bytes including the terminating nul (`param.h:6`).
+pub const MAXPATH: usize = 128;
+/// Device switch slots (`param.h:5`).
+pub const NDEV: usize = 10;
+/// Writable stack pages above exec's guard page (`param.h:13`).
+pub const USERSTACK: usize = 1;

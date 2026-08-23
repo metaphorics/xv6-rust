@@ -3,6 +3,13 @@ resolver = "3"
 members = ["abi", "kernel", "user", "mkfs", "xtask"]
 default-members = ["abi", "mkfs", "xtask"]
 
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+strip = "symbols"
 [workspace.package]
 edition = "2024"
 rust-version = "1.98"

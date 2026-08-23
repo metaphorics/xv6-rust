@@ -1,8 +1,8 @@
 //! Syscall dispatch and argument unpacking (`kernel/syscall.c`).
 
-use crate::dev::console;
 use crate::err::Err;
 use crate::proc::CurrentProc;
+use crate::sysfile;
 use crate::sysproc;
 use abi::Sys;
 
@@ -25,10 +25,16 @@ pub fn dispatch(p: &CurrentProc) {
         Sys::Sbrk => sysproc::sbrk(p),
         Sys::Pause => sysproc::pause(p),
         Sys::Uptime => sysproc::uptime(),
-        Sys::Write => sys_write(p),
-        // The remaining calls belong to the file-system and pipe layers
-        // (M5-M7); until those land they fail like any bad argument,
-        // and nothing in the boot path issues them.
+        Sys::Exec => sysfile::exec(p),
+        Sys::Fstat => sysfile::fstat(p),
+        Sys::Chdir => sysfile::chdir(p),
+        Sys::Dup => sysfile::dup(p),
+        Sys::Open => sysfile::open(p),
+        Sys::Write => sysfile::write(p),
+        Sys::Mknod => sysfile::mknod(p),
+        Sys::Close => sysfile::close(p),
+        Sys::Read => sysfile::read(p),
+        // Pipe and namespace mutation join in M7.
         _ => Err(Err::BadArg),
     };
 
@@ -55,24 +61,4 @@ pub fn arg_int(p: &CurrentProc, n: usize) -> i32 {
 /// Legality is copyin/copyout's to check, as in C.
 pub fn arg_addr(p: &CurrentProc, n: usize) -> u64 {
     arg_raw(p, n)
-}
-
-/// Interim initcode `sys_write`: write `n` bytes from fds 1 or 2 directly
-/// to the console.
-///
-/// M5 provides the real `File::Device(CONSOLE)` route, but the hand-built
-/// initcode has no inherited descriptors and cannot open `/dev/console`
-/// before M6 adds init and the file syscalls. Keeping this narrow bridge
-/// preserves the M4 boot proof; M6 removes it when init opens the device.
-fn sys_write(p: &CurrentProc) -> Result<usize, Err> {
-    let fd = arg_int(p, 0);
-    let buf = arg_addr(p, 1);
-    let n = arg_int(p, 2);
-    if n < 0 {
-        return Err(Err::BadArg);
-    }
-    if fd != 1 && fd != 2 {
-        return Err(Err::BadArg);
-    }
-    Ok(console::write(true, buf, n as usize))
 }

@@ -2,7 +2,11 @@
 target = "riscv64gc-unknown-none-elf"
 
 [target.riscv64gc-unknown-none-elf]
-rustflags = ["-Ccode-model=medium", "-Crelocation-model=static"]
+rustflags = [
+  "-Ccode-model=medium",
+  "-Crelocation-model=static",
+  "-Clink-arg=-Tuser/src/user.ld",
+]
 
 [target.x86_64-unknown-none]
 rustflags = ["-Crelocation-model=static"]

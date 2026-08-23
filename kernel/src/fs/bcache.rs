@@ -145,10 +145,6 @@ pub struct BufGuard {
 }
 
 impl BufGuard {
-    pub fn dev(&self) -> u32 {
-        CACHE.lock().meta[self.index].dev
-    }
-
     pub fn blockno(&self) -> u32 {
         CACHE.lock().meta[self.index].blockno
     }
