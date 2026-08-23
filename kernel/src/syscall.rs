@@ -57,14 +57,13 @@ pub fn arg_addr(p: &CurrentProc, n: usize) -> u64 {
     arg_raw(p, n)
 }
 
-/// `sys_write` for this milestone (`sysfile.c`'s filewrite plus
-/// console.c's consolewrite): write `n` bytes from the user buffer to
-/// the console for fds 1 and 2.
+/// Interim initcode `sys_write`: write `n` bytes from fds 1 or 2 directly
+/// to the console.
 ///
-/// Layering note: the file table is M5; until then this is the only
-/// write path, and it is exactly the path the file table will route
-/// fds 1 and 2 to (`File::Device(CONSOLE)` → `console::write`). M5's
-/// commit deletes this special case in favor of the table.
+/// M5 provides the real `File::Device(CONSOLE)` route, but the hand-built
+/// initcode has no inherited descriptors and cannot open `/dev/console`
+/// before M6 adds init and the file syscalls. Keeping this narrow bridge
+/// preserves the M4 boot proof; M6 removes it when init opens the device.
 fn sys_write(p: &CurrentProc) -> Result<usize, Err> {
     let fd = arg_int(p, 0);
     let buf = arg_addr(p, 1);
