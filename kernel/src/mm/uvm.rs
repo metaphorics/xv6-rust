@@ -130,7 +130,10 @@ pub fn unmap_range(pt: &mut PageTable, va: u64, npages: usize, do_free: bool) {
     let mut next = va;
     while let Some((mapped, pa)) = pt.take_next_leaf(next, end) {
         if do_free {
-            drop(PhysFrame::from_raw(pa));
+            // SAFETY: `take_next_leaf` removed this user mapping from the
+            // owning page table; user leaves were created by leaking one
+            // unique PhysFrame into that mapping.
+            drop(unsafe { PhysFrame::from_raw(pa) });
         }
         next = mapped + PAGE;
     }

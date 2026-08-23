@@ -37,9 +37,9 @@ pub fn kernel_end() -> PhysAddr {
 pub fn init() {
     let mut pa = page_round_up(kernel_end().0);
     while pa + PAGE_SIZE as u64 <= PHYSTOP.0 {
-        // Adopting and dropping each page runs the free path (kfree):
-        // junk-fill and push onto the freelist.
-        drop(PhysFrame::from_raw(PhysAddr(pa)));
+        // SAFETY: initialization visits each whole RAM page exactly once
+        // before the freelist is exposed, so no competing owner exists.
+        drop(unsafe { PhysFrame::from_raw(PhysAddr(pa)) });
         pa += PAGE_SIZE as u64;
     }
 }
@@ -64,7 +64,9 @@ pub fn alloc() -> Option<PhysFrame> {
 
     let pa = PhysAddr(head as u64);
     fill(pa, 0x05); // fill with junk (kalloc.c:80)
-    Some(PhysFrame::from_raw(pa))
+    // SAFETY: removing `head` from the locked freelist transfers its sole
+    // ownership to the returned frame.
+    Some(unsafe { PhysFrame::from_raw(pa) })
 }
 
 /// Return `pa` to the freelist (`kfree`, kalloc.c:47-66). Called only by

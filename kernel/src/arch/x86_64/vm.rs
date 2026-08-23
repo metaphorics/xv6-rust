@@ -284,7 +284,9 @@ fn freewalk(root: PhysAddr, level: u32) {
             panic!("freewalk: user leaf");
         }
     }
-    drop(PhysFrame::from_raw(root));
+    // SAFETY: recursive freewalk removed every owned child; `root` is the
+    // unique frame leaked into this page-table node by PageTable.
+    drop(unsafe { PhysFrame::from_raw(root) });
 }
 
 fn table_of(pa: PhysAddr) -> *mut [u64; 512] {

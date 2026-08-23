@@ -339,7 +339,9 @@ fn freewalk(root: PhysAddr) {
             panic!("freewalk: leaf");
         }
     }
-    drop(PhysFrame::from_raw(root));
+    // SAFETY: recursive freewalk removed every child and leaf; `root` is
+    // the unique frame leaked into this page-table node by PageTable.
+    drop(unsafe { PhysFrame::from_raw(root) });
 }
 
 /// The 512-PTE page-table page at `pa` (vm.c:268-269). A raw pointer, not

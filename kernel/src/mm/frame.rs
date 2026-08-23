@@ -14,14 +14,17 @@ pub struct PhysFrame {
 }
 
 impl PhysFrame {
-    /// Adopt the page at `pa`. Crate-private: callers must hold the only
-    /// claim to the page — the allocator (freerange/alloc) or a page-table
-    /// tree being unwound. The `kfree` range checks (kalloc.c:52-54) hold
-    /// by construction and are asserted in debug builds.
-    pub(crate) fn from_raw(pa: PhysAddr) -> Self {
-        debug_assert!(pa.0.is_multiple_of(PAGE_SIZE as u64), "kfree: unaligned");
-        debug_assert!(pa.0 >= kalloc::kernel_end().0, "kfree: below end");
-        debug_assert!(pa.0 < PHYSTOP.0, "kfree: above PHYSTOP");
+    /// Adopt exclusive ownership of the page at `pa`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must own the only claim to this page. In particular,
+    /// `pa` must not already be represented by another `PhysFrame`, a live
+    /// page-table mapping that retains ownership, or the allocator freelist.
+    pub(crate) unsafe fn from_raw(pa: PhysAddr) -> Self {
+        assert!(pa.0.is_multiple_of(PAGE_SIZE as u64), "kfree: unaligned");
+        assert!(pa.0 >= kalloc::kernel_end().0, "kfree: below end");
+        assert!(pa.0 < PHYSTOP.0, "kfree: above PHYSTOP");
         PhysFrame { pa }
     }
 
