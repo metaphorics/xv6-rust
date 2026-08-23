@@ -30,4 +30,5 @@ pub fn init() {
     *SUPERBLOCK.lock() = sb;
     drop(buffer);
     log::init(ROOTDEV, sb);
+    inode::reclaim(ROOTDEV);
 }

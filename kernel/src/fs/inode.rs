@@ -179,6 +179,28 @@ pub fn get(dev: u32, inum: u32) -> Inode {
         return Inode { index };
     }
 }
+/// Reclaim on-disk inodes left unlinked by a crash (`ireclaim`).
+pub fn reclaim(dev: u32) {
+    let sb = superblock();
+    for inum in 1..sb.ninodes {
+        let block = bcache::bread(dev, inode_block(inum, sb.inodestart));
+        let at = inum as usize % IPB as usize * Dinode::ENCODED_LEN;
+        let disk_inode = Dinode::decode(&block.data()[at..at + Dinode::ENCODED_LEN])
+            .expect("invalid dinode encoding");
+        let orphaned = disk_inode.r#type != 0 && disk_inode.nlink == 0;
+        drop(block);
+        if !orphaned {
+            continue;
+        }
+
+        crate::printk::line(format_args!("ireclaim: orphaned inode {inum}"));
+        let operation = log::begin_op();
+        let inode = get(dev, inum);
+        drop(inode.lock());
+        drop(inode);
+        drop(operation);
+    }
+}
 
 /// Allocate a free on-disk inode. Caller owns a transaction.
 pub fn alloc(dev: u32, kind: FileType) -> Option<Inode> {

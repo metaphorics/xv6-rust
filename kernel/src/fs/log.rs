@@ -166,6 +166,12 @@ fn install_trans(recovering: bool) {
         (log.dev, log.start, log.header)
     };
     for tail in 0..header.n as usize {
+        if recovering {
+            crate::printk::line(format_args!(
+                "recovering tail {} dst {}",
+                tail, header.block[tail]
+            ));
+        }
         let log_buffer = bcache::bread(dev, start + tail as u32 + 1);
         let mut destination = bcache::bread(dev, header.block[tail]);
         destination.data_mut().copy_from_slice(log_buffer.data());

@@ -40,6 +40,10 @@ impl Write for Writer {
 /// The console lock (the `pr` spinlock, printk.c:22-24); a const
 /// construction replaces `printkinit` (printk.c:148-152).
 pub(crate) static PRINTK: SpinLock<Writer> = SpinLock::new(Writer);
+pub(crate) fn line(args: fmt::Arguments<'_>) {
+    let mut writer = PRINTK.lock();
+    let _ = writeln!(&mut *writer, "{args}");
+}
 
 /// `fmt` sink for the panic path: the polled UART only, so a wedged
 /// transmit ring or a held lock cannot eat the panic message
