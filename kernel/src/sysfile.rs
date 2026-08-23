@@ -34,12 +34,16 @@ fn fd_alloc(process: &CurrentProc, file: FileHandle) -> Result<usize, Err> {
 }
 
 fn fetch_str(process: &CurrentProc, addr: u64, dst: &mut [u8]) -> Result<usize, Err> {
-    uvm::copy_instr(process.pagetable_mut(), process.sz(), dst, addr)
+    let mut memory = process.user_memory();
+    let size = memory.size();
+    uvm::copy_instr(memory.pagetable_mut(), size, dst, addr)
 }
 
 fn fetch_addr(process: &CurrentProc, addr: u64) -> Result<u64, Err> {
     let mut bytes = [0; size_of::<u64>()];
-    uvm::copy_in(process.pagetable_mut(), process.sz(), &mut bytes, addr)?;
+    let mut memory = process.user_memory();
+    let size = memory.size();
+    uvm::copy_in(memory.pagetable_mut(), size, &mut bytes, addr)?;
     Ok(u64::from_le_bytes(bytes))
 }
 
@@ -76,12 +80,10 @@ pub fn fstat(process: &CurrentProc) -> Result<usize, Err> {
     let (_, file) = arg_fd(process, 0)?;
     let stat = file.stat()?;
     let bytes = encode_stat(stat);
-    uvm::copy_out(
-        process.pagetable_mut(),
-        process.sz(),
-        arg_addr(process, 1),
-        &bytes,
-    )?;
+    let dst = arg_addr(process, 1);
+    let mut memory = process.user_memory();
+    let size = memory.size();
+    uvm::copy_out(memory.pagetable_mut(), size, dst, &bytes)?;
     Ok(0)
 }
 
@@ -155,12 +157,13 @@ pub fn pipe(process: &CurrentProc) -> Result<usize, Err> {
     let mut bytes = [0; 2 * size_of::<i32>()];
     bytes[..4].copy_from_slice(&(read_fd as i32).to_le_bytes());
     bytes[4..].copy_from_slice(&(write_fd as i32).to_le_bytes());
-    if let Err(err) = uvm::copy_out(
-        process.pagetable_mut(),
-        process.sz(),
-        arg_addr(process, 0),
-        &bytes,
-    ) {
+    let dst = arg_addr(process, 0);
+    let result = {
+        let mut memory = process.user_memory();
+        let size = memory.size();
+        uvm::copy_out(memory.pagetable_mut(), size, dst, &bytes)
+    };
+    if let Err(err) = result {
         drop(process.replace_file(read_fd, None));
         drop(process.replace_file(write_fd, None));
         return Err(err);

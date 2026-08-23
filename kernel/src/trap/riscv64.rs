@@ -74,15 +74,19 @@ pub extern "C" fn usertrap() -> u64 {
         syscall::dispatch(&p);
     } else {
         which_dev = devintr();
-        let faulted = which_dev == 0
-            && matches!(scause, 13 | 15)
-            && uvm::fault(
-                p.pagetable_mut(),
-                p.sz(),
+        let faulted = if which_dev == 0 && matches!(scause, 13 | 15) {
+            let mut memory = p.user_memory();
+            let size = memory.size();
+            uvm::fault(
+                memory.pagetable_mut(),
+                size,
                 riscv64::r_stval() as u64,
                 scause == 13,
             )
-            .is_some();
+            .is_some()
+        } else {
+            false
+        };
         if which_dev == 0 && !faulted {
             println!(
                 "usertrap(): unexpected scause {:#x} pid={}",
@@ -129,12 +133,15 @@ pub fn usertrapret(p: &CurrentProc) -> ! {
 
     // Set up trapframe values that uservec will need when the process
     // next traps into the kernel (trap.c:111-118).
-    let tf = p.trapframe();
-    tf.kernel_satp = riscv64::r_satp() as u64;
-    tf.kernel_sp = p.kstack_top();
-    let usertrap_entry: extern "C" fn() -> u64 = usertrap;
-    tf.kernel_trap = usertrap_entry as usize as u64;
-    tf.kernel_hartid = arch::cpu_id() as u64;
+    let epc = {
+        let mut tf = p.trapframe();
+        tf.kernel_satp = riscv64::r_satp() as u64;
+        tf.kernel_sp = p.kstack_top();
+        let usertrap_entry: extern "C" fn() -> u64 = usertrap;
+        tf.kernel_trap = usertrap_entry as usize as u64;
+        tf.kernel_hartid = arch::cpu_id() as u64;
+        tf.epc
+    };
 
     // Set S Previous Privilege mode to User, and enable interrupts in
     // user mode (trap.c:120-126).
@@ -143,10 +150,11 @@ pub fn usertrapret(p: &CurrentProc) -> ! {
 
     // Set S Exception Program Counter to the saved user pc
     // (trap.c:128-129).
-    riscv64::w_sepc(tf.epc as usize);
+    riscv64::w_sepc(epc as usize);
 
     // Enter the trampoline with the user satp in a0 (proc.c:541-543).
-    riscv64::trampoline::user_ret(p.pagetable().satp_value())
+    let satp = p.user_memory().pagetable().satp_value();
+    riscv64::trampoline::user_ret(satp)
 }
 
 /// Interrupts and exceptions from kernel code arrive here through

@@ -134,15 +134,17 @@ pub struct Proc {
     shared: SpinLock<ProcShared>,
     /// Parent slot, under [`WAIT_LOCK`] only (proc.h:92-93).
     parent: UnsafeCell<usize>,
-    /// Process-private fields (proc.h:95-103), behind the token
-    /// discipline described in the module docs.
+    /// Process-private fields (proc.h:95-103). Running-process access is
+    /// serialized by `private_borrowed`; lifecycle paths access it only
+    /// while holding `shared` with a non-running state.
     private: UnsafeCell<ProcPrivate>,
+    private_borrowed: AtomicBool,
 }
 
 // SAFETY: `shared` is a SpinLock (Sync for Send payloads); `parent` is
 // written only under WAIT_LOCK, one writer at a time; `private` is
-// reached only by the slot's running process or under its `shared`
-// lock — the disciplines proc.h documents and this module enforces.
+// reached either by one runtime-checked running-process borrow or under
+// the slot's `shared` lock while the process is not running.
 unsafe impl Sync for Proc {}
 
 /// The process table (`proc[NPROC]`, proc.c:11). Const-constructed: C's
@@ -168,12 +170,15 @@ static PROCS: [Proc; NPROC] = [const {
             cwd: None,
             ofile: [const { None }; NOFILE],
         }),
+        private_borrowed: AtomicBool::new(false),
     }
 }; NPROC];
 
-/// A token for the process running on this hart (`myproc`, proc.c:82-90).
-/// Existing is proof that `cpu::current()` names this slot; its methods
-/// are the only safe reach into `ProcPrivate`.
+/// A token naming the process running on this hart (`myproc`, proc.c:82-90).
+///
+/// Tokens may be obtained repeatedly, but access to process-private state
+/// goes through a runtime-checked guard. Consequently repeated `my_proc()`
+/// calls cannot mint overlapping Rust references.
 pub struct CurrentProc {
     slot: usize,
 }
@@ -186,10 +191,101 @@ pub fn my_proc() -> Option<CurrentProc> {
     slot.map(|slot| CurrentProc { slot })
 }
 
+struct PrivateGuard<'a> {
+    proc: &'a Proc,
+}
+
+impl core::ops::Deref for PrivateGuard<'_> {
+    type Target = ProcPrivate;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: construction acquired `private_borrowed`, and Drop
+        // releases it only after every reference derived from this guard.
+        unsafe { private(self.proc) }
+    }
+}
+
+impl core::ops::DerefMut for PrivateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: as Deref; the guard is the unique private-state borrower.
+        unsafe { &mut *private_ptr(self.proc) }
+    }
+}
+
+impl Drop for PrivateGuard<'_> {
+    fn drop(&mut self) {
+        assert!(
+            self.proc.private_borrowed.swap(false, Ordering::Release),
+            "current process private borrow was not held"
+        );
+    }
+}
+
+/// A scoped borrow of the current process's user-memory state.
+pub struct UserMemory<'a> {
+    private: PrivateGuard<'a>,
+}
+
+impl UserMemory<'_> {
+    pub fn size(&self) -> u64 {
+        self.private.sz
+    }
+
+    pub fn set_size(&mut self, size: u64) {
+        self.private.sz = size;
+    }
+    pub fn pagetable(&self) -> &PageTable {
+        self.private.pagetable.as_ref().expect("proc pagetable")
+    }
+
+    pub fn pagetable_mut(&mut self) -> &mut PageTable {
+        self.private.pagetable.as_mut().expect("proc pagetable")
+    }
+}
+
+/// A scoped exclusive borrow of the current process's saved registers.
+pub struct TrapFrameGuard<'a> {
+    private: PrivateGuard<'a>,
+}
+
+impl core::ops::Deref for TrapFrameGuard<'_> {
+    type Target = TrapFrame;
+
+    fn deref(&self) -> &Self::Target {
+        let pa = self
+            .private
+            .trapframe_page
+            .as_ref()
+            .expect("trapframe page")
+            .addr();
+        // SAFETY: `private` is the unique running-process borrow and owns
+        // this frame; the returned reference cannot outlive the guard.
+        unsafe { &*(pa.0 as usize as *const TrapFrame) }
+    }
+}
+
+impl core::ops::DerefMut for TrapFrameGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.private.trapframe()
+    }
+}
+
 impl CurrentProc {
-    /// The slot's table entry.
-    fn proc(&self) -> &'static Proc {
+    /// The slot's table entry. The returned lifetime is tied to this token;
+    /// safe private-state references require `private_guard` below.
+    fn proc(&self) -> &Proc {
         &PROCS[self.slot]
+    }
+
+    fn private_guard(&self) -> PrivateGuard<'_> {
+        assert!(
+            self.proc()
+                .private_borrowed
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok(),
+            "overlapping current process private borrow"
+        );
+        PrivateGuard { proc: self.proc() }
     }
 
     /// Table slot index.
@@ -205,7 +301,7 @@ impl CurrentProc {
     }
 
     /// The shared-state lock (`&p->lock`).
-    pub fn shared(&self) -> &'static SpinLock<ProcShared> {
+    pub fn shared(&self) -> &SpinLock<ProcShared> {
         &self.proc().shared
     }
 
@@ -231,51 +327,52 @@ impl CurrentProc {
 
     /// Size of user memory (bytes).
     pub fn sz(&self) -> u64 {
-        // SAFETY: `self` is the running process — the token discipline.
-        unsafe { private(self.proc()) }.sz
+        self.private_guard().sz
     }
 
     /// Update the user-memory size (`p->sz = sz`, growproc).
     pub fn set_sz(&self, sz: u64) {
-        // SAFETY: as `sz`.
-        unsafe { private_mut(self.proc()) }.sz = sz;
+        self.private_guard().sz = sz;
     }
 
-    /// The user page table.
-    pub fn pagetable(&self) -> &'static PageTable {
-        // SAFETY: as `sz`; the token proves the slot has one.
-        unsafe { private(self.proc()) }
-            .pagetable
+    /// Borrow the page table and its matching size as one linear unit.
+    pub fn user_memory(&self) -> UserMemory<'_> {
+        UserMemory {
+            private: self.private_guard(),
+        }
+    }
+
+    /// Borrow the saved user register state for one lexical scope.
+    pub fn trapframe(&self) -> TrapFrameGuard<'_> {
+        TrapFrameGuard {
+            private: self.private_guard(),
+        }
+    }
+
+    /// Physical address of the stable trapframe page.
+    ///
+    /// This is an integer rather than a reference; architecture return
+    /// assembly validates its use under the current-process invariant.
+    pub fn trapframe_addr(&self) -> u64 {
+        self.private_guard()
+            .trapframe_page
             .as_ref()
-            .expect("proc pagetable")
-    }
-
-    /// The user page table, mutably (uvm operations).
-    pub fn pagetable_mut(&self) -> &'static mut PageTable {
-        // SAFETY: as `sz`; uvm work on the running process's own table.
-        unsafe { private_mut(self.proc()) }
-            .pagetable
-            .as_mut()
-            .expect("proc pagetable")
-    }
-
-    /// The saved user register state (`p->trapframe`).
-    pub fn trapframe(&self) -> &'static mut TrapFrame {
-        // SAFETY: as `sz` — the trapframe page belongs to this process.
-        unsafe { private_mut(self.proc()) }.trapframe()
+            .expect("trapframe page")
+            .addr()
+            .0
     }
 
     /// The saved kernel context (`&p->context`, for `swtch`).
     fn context_ptr(&self) -> *mut Context {
-        // SAFETY: as `sz`; the address is only dereferenced by `swtch`
-        // under the scheduler discipline.
-        unsafe { core::ptr::addr_of_mut!(private_mut(self.proc()).context) }
+        // SAFETY: no private guard crosses a scheduling operation; the raw
+        // address is dereferenced only by `swtch` under the scheduler
+        // discipline.
+        unsafe { core::ptr::addr_of_mut!((*private_ptr(self.proc())).context) }
     }
 
     /// The name bytes (for fork's copy and diagnostics).
     pub fn name_bytes(&self) -> [u8; 16] {
-        // SAFETY: as `sz`.
-        unsafe { private(self.proc()) }.name
+        self.private_guard().name
     }
 
     /// The name as a displayable value, up to the first nul.
@@ -284,37 +381,30 @@ impl CurrentProc {
     }
 
     pub fn cwd(&self) -> Option<Inode> {
-        // SAFETY: this is the running process's private state.
-        unsafe { private(self.proc()) }.cwd.as_ref().cloned()
+        self.private_guard().cwd.as_ref().cloned()
     }
 
     pub fn set_cwd(&self, cwd: Option<Inode>) {
-        // SAFETY: this is the running process's private state.
-        unsafe { private_mut(self.proc()) }.cwd = cwd;
+        self.private_guard().cwd = cwd;
     }
 
     pub fn file(&self, fd: usize) -> Option<FileHandle> {
-        // SAFETY: this is the running process's private descriptor table.
-        unsafe { private(self.proc()) }
+        self.private_guard()
             .ofile
             .get(fd)
             .and_then(|file| file.as_ref().cloned())
     }
 
     pub fn replace_file(&self, fd: usize, file: Option<FileHandle>) -> Option<FileHandle> {
-        // SAFETY: this is the running process's private descriptor table.
-        let files = &mut unsafe { private_mut(self.proc()) }.ofile;
-        let slot = files.get_mut(fd)?;
+        let mut private = self.private_guard();
+        let slot = private.ofile.get_mut(fd)?;
         core::mem::replace(slot, file)
     }
 
     /// Allocate an empty process page table sharing this process's
     /// trapframe page. Exec builds a replacement image in this table.
     pub fn new_exec_pagetable(&self) -> Option<PageTable> {
-        // SAFETY: this is the running process's private trapframe owner.
-        let private = unsafe { private(self.proc()) };
-        let trapframe = private.trapframe_page.as_ref()?.addr();
-        proc_pagetable(self.slot, trapframe)
+        proc_pagetable(self.slot, PhysAddr(self.trapframe_addr()))
     }
 
     /// Atomically install a completed exec image, then release the old one.
@@ -327,8 +417,7 @@ impl CurrentProc {
         argv: u64,
         name: [u8; 16],
     ) {
-        // SAFETY: this is the running process's private state.
-        let private = unsafe { private_mut(self.proc()) };
+        let mut private = self.private_guard();
         let old_sz = private.sz;
         let old = private
             .pagetable
@@ -362,17 +451,18 @@ fn as_str(bytes: &[u8]) -> &str {
 ///
 /// # Safety
 ///
-/// Caller must be the slot's running process (via `CurrentProc`) or hold
-/// the slot's `shared` lock with state `Used` — the alloc/fork paths
-/// (proc.h:95-103's privacy discipline).
+/// Caller must hold the slot's `private_borrowed` guard, or hold the
+/// slot's `shared` lock while the process is not running (alloc/free/fork).
 unsafe fn private(p: &Proc) -> &ProcPrivate {
     // SAFETY: caller contract above.
-    unsafe { &*p.private.get() }
+    unsafe { &*private_ptr(p) }
 }
-/// Mutate a slot's private fields. Same contract as [`private`].
-unsafe fn private_mut(p: *const Proc) -> &'static mut ProcPrivate {
-    // SAFETY: caller contract of `private`; `p` points into static PROCS.
-    unsafe { &mut *(*p).private.get() }
+
+/// Raw access to a slot's interior-mutable private cell. Turning this into
+/// a reference requires either `PrivateGuard` or the lifecycle lock/state
+/// precondition documented by [`private`].
+fn private_ptr(p: &Proc) -> *mut ProcPrivate {
+    p.private.get()
 }
 
 /// Read a slot's parent (under [`WAIT_LOCK`]).
@@ -422,7 +512,7 @@ fn allocproc() -> Option<(usize, SpinGuard<'static, ProcShared>)> {
         };
         // SAFETY: we hold this slot's shared lock with state Used —
         // the alloc path's sanctioned private access.
-        let private = unsafe { private_mut(proc) };
+        let private = unsafe { &mut *private_ptr(proc) };
         private.trapframe_page = Some(frame);
 
         // An empty user page table with trampoline and trapframe
@@ -489,7 +579,7 @@ fn proc_pagetable(slot: usize, trapframe_pa: PhysAddr) -> Option<PageTable> {
 fn freeproc(slot: usize, shared: &mut SpinGuard<'_, ProcShared>) {
     // SAFETY: caller holds the slot's shared lock — freeproc's
     // precondition (proc.c:154).
-    let private = unsafe { private_mut(&PROCS[slot]) };
+    let private = unsafe { &mut *private_ptr(&PROCS[slot]) };
     // Dropping the frame returns the page to the allocator (kfree,
     // proc.c:158-159).
     drop(private.trapframe_page.take());
@@ -562,7 +652,7 @@ fn context_ptr_of(slot: usize) -> *mut Context {
     // SAFETY: only the scheduler (or sched on the running process)
     // reaches this, under the slot's shared lock held — state
     // transitions are serialized.
-    unsafe { core::ptr::addr_of_mut!(private_mut(&PROCS[slot]).context) }
+    unsafe { core::ptr::addr_of_mut!((*private_ptr(&PROCS[slot])).context) }
 }
 
 /// Switch to the scheduler (`sched`, proc.c:472-497). Must hold only the
@@ -686,19 +776,22 @@ pub fn fork() -> Result<usize, Err> {
         return Err(Err::NoMem);
     };
 
-    // Copy user memory from parent to child (proc.c:270-275).
+    // Copy user memory from parent to child (proc.c:270-282).
     // SAFETY: the child's shared lock is held with state Used — the
     // fork path's sanctioned private access.
-    let nprivate = unsafe { private_mut(&PROCS[nslot]) };
-    let pagetable = nprivate.pagetable.as_mut().expect("child pagetable");
-    if uvm::copy(p.pagetable(), pagetable, p.sz()).is_err() {
-        freeproc(nslot, &mut nshared);
-        return Err(Err::NoMem);
-    }
-    nprivate.sz = p.sz();
+    let nprivate = unsafe { &mut *private_ptr(&PROCS[nslot]) };
+    let parent_size = {
+        let memory = p.user_memory();
+        let pagetable = nprivate.pagetable.as_mut().expect("child pagetable");
+        if uvm::copy(memory.pagetable(), pagetable, memory.size()).is_err() {
+            freeproc(nslot, &mut nshared);
+            return Err(Err::NoMem);
+        }
+        memory.size()
+    };
+    nprivate.sz = parent_size;
 
-    // Copy saved user registers; cause fork to return 0 in the child
-    // (proc.c:278-282).
+    // Copy saved user registers; cause fork to return 0 in the child.
     *nprivate.trapframe() = *p.trapframe();
     nprivate.trapframe().set_ret(0);
 
@@ -793,7 +886,9 @@ pub fn wait(status_addr: u64) -> Result<usize, Err> {
                 let pid = shared.pid;
                 if status_addr != 0 {
                     let xstate = shared.xstate.to_le_bytes();
-                    if uvm::copy_out(p.pagetable_mut(), p.sz(), status_addr, &xstate).is_err() {
+                    let mut memory = p.user_memory();
+                    let size = memory.size();
+                    if uvm::copy_out(memory.pagetable_mut(), size, status_addr, &xstate).is_err() {
                         return Err(Err::BadArg);
                     }
                 }
@@ -840,17 +935,18 @@ pub fn kill(pid: i32) -> Result<(), Err> {
 /// (`growproc`, proc.c:233-254).
 pub fn grow(n: i64) -> Result<(), Err> {
     let p = my_proc().expect("grow: no current proc");
-    let sz = p.sz();
+    let mut memory = p.user_memory();
+    let sz = memory.size();
     if n > 0 {
         let n = n as u64;
         if sz + n > TRAPFRAME.0 {
             return Err(Err::TooBig);
         }
-        let newsz = uvm::alloc(p.pagetable_mut(), sz, sz + n, Perm::W)?;
-        p.set_sz(newsz);
+        let newsz = uvm::alloc(memory.pagetable_mut(), sz, sz + n, Perm::W)?;
+        memory.set_size(newsz);
     } else if n < 0 {
-        let newsz = uvm::dealloc(p.pagetable_mut(), sz, (sz as i64 + n) as u64);
-        p.set_sz(newsz);
+        let newsz = uvm::dealloc(memory.pagetable_mut(), sz, (sz as i64 + n) as u64);
+        memory.set_size(newsz);
     }
     Ok(())
 }
@@ -871,7 +967,9 @@ pub fn either_copy_in(dst: &mut [u8], user_src: bool, srcva: u64) -> Result<(), 
         Ok(())
     } else {
         let p = my_proc().expect("either_copy_in: no current proc");
-        uvm::copy_in(p.pagetable_mut(), p.sz(), dst, srcva)
+        let mut memory = p.user_memory();
+        let size = memory.size();
+        uvm::copy_in(memory.pagetable_mut(), size, dst, srcva)
     }
 }
 
@@ -886,7 +984,9 @@ pub fn either_copy_out(src: &[u8], user_dst: bool, dstva: u64) -> Result<(), Err
         Ok(())
     } else {
         let p = my_proc().expect("either_copy_out: no current proc");
-        uvm::copy_out(p.pagetable_mut(), p.sz(), dstva, src)
+        let mut memory = p.user_memory();
+        let size = memory.size();
+        uvm::copy_out(memory.pagetable_mut(), size, dstva, src)
     }
 }
 

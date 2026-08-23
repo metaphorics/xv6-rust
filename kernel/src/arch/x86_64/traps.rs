@@ -3,7 +3,6 @@
 use core::cell::UnsafeCell;
 
 use super::gdt;
-use super::trapframe::TrapFrame;
 use super::vm::{TRAP_ENTRY_VA, TRAPFRAME};
 use crate::arch::PAGE_SIZE;
 
@@ -63,7 +62,7 @@ pub fn idt_addr() -> u64 {
 
 unsafe extern "C" {
     static x86_vector_table: [u64; 57];
-    fn x86_userret(tf: *const TrapFrame, cr3: u64) -> !;
+    fn x86_userret(trapframe_pa: u64, cr3: u64) -> !;
     fn x86_common_entry();
 }
 
@@ -101,15 +100,16 @@ fn trampoline_address(address: u64) -> u64 {
     TRAP_ENTRY_VA + offset
 }
 
-pub fn return_to_user(tf: &TrapFrame, cr3: u64) -> ! {
+pub fn return_to_user(trapframe_pa: u64, cr3: u64) -> ! {
     let entry = trampoline_address(x86_userret as *const () as usize as u64);
-    // SAFETY: entry is the executable x86_userret offset in the mapped trampoline;
-    // rdi/rsi carry its declared arguments and the routine never returns.
+    // SAFETY: `trapframe_pa` is the current process's stable, mapped
+    // trapframe page; entry is executable x86_userret, rdi/rsi carry its
+    // declared integer arguments, and the routine never returns.
     unsafe {
         core::arch::asm!(
             "jmp rax",
             in("rax") entry,
-            in("rdi") tf,
+            in("rdi") trapframe_pa,
             in("rsi") cr3,
             options(noreturn)
         )

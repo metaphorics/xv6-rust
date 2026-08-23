@@ -57,7 +57,7 @@ pub extern "C" fn x86_trap_dispatch(stack: &TrapStack) {
 }
 
 fn save_user(stack: &TrapStack, p: &CurrentProc) {
-    let tf = p.trapframe();
+    let mut tf = p.trapframe();
     tf.r15 = stack.r15;
     tf.r14 = stack.r14;
     tf.r13 = stack.r13;
@@ -93,7 +93,12 @@ fn user_trap(stack: &TrapStack) -> ! {
         let address: u64;
         // SAFETY: CR2 is the architectural page-fault linear address.
         unsafe { asm!("mov {}, cr2", out(reg) address, options(nomem, nostack, preserves_flags)) };
-        if uvm::fault(p.pagetable_mut(), p.sz(), address, stack.error & 2 == 0).is_none() {
+        let faulted = {
+            let mut memory = p.user_memory();
+            let size = memory.size();
+            uvm::fault(memory.pagetable_mut(), size, address, stack.error & 2 == 0).is_some()
+        };
+        if !faulted {
             println!(
                 "usertrap(): page fault va={:#x} rip={:#x} pid={}",
                 address,
@@ -173,8 +178,8 @@ pub fn clockintr() {
 
 pub fn usertrapret(p: &CurrentProc) -> ! {
     arch::intr_off();
-    let tf = p.trapframe();
-    tf.kernel_sp = p.kstack_top();
+    p.trapframe().kernel_sp = p.kstack_top();
     gdt::set_rsp0(p.kstack_top());
-    traps::return_to_user(tf, p.pagetable().cr3_value())
+    let cr3 = p.user_memory().pagetable().cr3_value();
+    traps::return_to_user(p.trapframe_addr(), cr3)
 }
