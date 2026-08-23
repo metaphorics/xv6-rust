@@ -71,7 +71,7 @@ fn parse_arch(args: &[String], program: Option<&str>) -> String {
         return arch.clone();
     }
     let name = program.unwrap_or("cargo xtask");
-    eprintln!("{name}: run expects --arch <riscv64>");
+    eprintln!("{name}: run expects --arch <riscv64|x86_64>");
     std::process::exit(2);
 }
 
@@ -144,6 +144,47 @@ fn check() {
             .args(["build", "--release", "--bins"]),
     );
     step(
+        "clippy, x86_64 kernel dev",
+        Command::new("cargo")
+            .current_dir(root.join("kernel"))
+            .args([
+                "clippy",
+                "--target",
+                "x86_64-unknown-none",
+                "--",
+                "-D",
+                "warnings",
+            ]),
+    );
+    step(
+        "x86_64 kernel release",
+        Command::new("cargo")
+            .current_dir(root.join("kernel"))
+            .args(["build", "--release", "--target", "x86_64-unknown-none"]),
+    );
+    step(
+        "clippy, x86_64 user dev",
+        Command::new("cargo").current_dir(root.join("user")).args([
+            "clippy",
+            "--bins",
+            "--target",
+            "x86_64-unknown-none",
+            "--",
+            "-D",
+            "warnings",
+        ]),
+    );
+    step(
+        "x86_64 user release",
+        Command::new("cargo").current_dir(root.join("user")).args([
+            "build",
+            "--release",
+            "--bins",
+            "--target",
+            "x86_64-unknown-none",
+        ]),
+    );
+    step(
         "host unit tests",
         Command::new("cargo")
             .current_dir(root)
@@ -152,22 +193,22 @@ fn check() {
 }
 
 fn run(arch: &str, echo_test: bool) {
-    require_riscv64(arch);
+    require_arch(arch);
     let root = workspace_root();
-    let kernel = build_kernel(root);
-    let programs = build_user_programs(root, &[]);
+    let kernel = build_kernel(root, arch);
+    let programs = build_user_programs(root, arch, &[]);
     let image = build_fs_image(root, &programs);
-    let qemu = require_qemu();
+    let qemu = require_qemu(arch);
     let image_files = programs.len() + 1;
     if echo_test {
-        boot_echo_test(qemu, &kernel, &image);
+        boot_echo_test(qemu, arch, &kernel, &image);
     } else {
-        boot_shell_smoke(qemu, &kernel, &image, image_files);
+        boot_shell_smoke(qemu, arch, &kernel, &image, image_files);
     }
 }
 
 fn test_xv6(arch: &str, test: TestKind) {
-    require_riscv64(arch);
+    require_arch(arch);
     let root = workspace_root();
     let extra_programs: &[&str] = match test {
         TestKind::Quick | TestKind::Full => &["usertests"],
@@ -175,9 +216,10 @@ fn test_xv6(arch: &str, test: TestKind) {
     };
     let harness = TestHarness {
         root,
-        kernel: build_kernel(root),
-        programs: build_user_programs(root, extra_programs),
-        qemu: require_qemu(),
+        arch: arch.to_owned(),
+        kernel: build_kernel(root, arch),
+        programs: build_user_programs(root, arch, extra_programs),
+        qemu: require_qemu(arch),
     };
     match test {
         TestKind::Quick | TestKind::Full => harness.usertests(test),
@@ -193,14 +235,23 @@ fn test_xv6(arch: &str, test: TestKind) {
     }
 }
 
-fn require_riscv64(arch: &str) {
-    if arch != "riscv64" {
-        fail("only riscv64 is implemented");
+fn require_arch(arch: &str) {
+    if !matches!(arch, "riscv64" | "x86_64") {
+        fail("arch must be riscv64 or x86_64");
+    }
+}
+
+fn target_triple(arch: &str) -> &'static str {
+    match arch {
+        "riscv64" => "riscv64gc-unknown-none-elf",
+        "x86_64" => "x86_64-unknown-none",
+        _ => fail("unsupported architecture"),
     }
 }
 
 struct TestHarness {
     root: &'static Path,
+    arch: String,
     kernel: PathBuf,
     programs: Vec<PathBuf>,
     qemu: &'static str,
@@ -218,7 +269,7 @@ impl TestHarness {
             TestKind::Full => (b"usertests\n".as_slice(), Duration::from_secs(600)),
             _ => fail("internal error: invalid usertests mode"),
         };
-        let (mut child, mut console) = spawn_qemu(self.qemu, &self.kernel, &image);
+        let (mut child, mut console) = spawn_qemu(self.qemu, &self.arch, &self.kernel, &image);
         send_after_prompt(&mut child, &mut console, command);
         let matched = console.wait_for_any(
             &mut child,
@@ -237,12 +288,12 @@ impl TestHarness {
         println!("==> log crash recovery");
         for attempt in 1..=5 {
             let image = self.fresh_image();
-            let (mut child, mut console) = spawn_qemu(self.qemu, &self.kernel, &image);
+            let (mut child, mut console) = spawn_qemu(self.qemu, &self.arch, &self.kernel, &image);
             send_after_prompt(&mut child, &mut console, b"logstress f0 f1 f2 f3 f4 f5\n");
             thread::sleep(Duration::from_secs(2));
             kill(&mut child);
 
-            let (mut child, mut console) = spawn_qemu(self.qemu, &self.kernel, &image);
+            let (mut child, mut console) = spawn_qemu(self.qemu, &self.arch, &self.kernel, &image);
             let recovered = console.wait_for_any(
                 &mut child,
                 &[b"recovering tail ", b"init: starting sh"],
@@ -272,24 +323,30 @@ impl TestHarness {
     fn orphan(&self, command: &[u8], name: &str) {
         println!("==> {name} crash recovery");
         let image = self.fresh_image();
-        let (mut child, mut console) = spawn_qemu(self.qemu, &self.kernel, &image);
+        let (mut child, mut console) = spawn_qemu(self.qemu, &self.arch, &self.kernel, &image);
         send_after_prompt(&mut child, &mut console, command);
         console.wait_for(&mut child, b"wait for kill and reclaim");
         kill(&mut child);
 
-        let (mut child, mut console) = spawn_qemu(self.qemu, &self.kernel, &image);
+        let (mut child, mut console) = spawn_qemu(self.qemu, &self.arch, &self.kernel, &image);
         console.wait_for(&mut child, b"ireclaim: orphaned inode ");
         kill(&mut child);
         println!("XTASK: {name} recovery ok");
     }
 }
 
-fn build_kernel(root: &Path) -> PathBuf {
-    println!("==> cargo build --release, kernel");
+fn build_kernel(root: &Path, arch: &str) -> PathBuf {
+    println!("==> cargo build --release, kernel ({arch})");
     let executables = cargo_executables(
         Command::new("cargo")
             .current_dir(root.join("kernel"))
-            .args(["build", "--release", "--message-format=json"]),
+            .args([
+                "build",
+                "--release",
+                "--target",
+                target_triple(arch),
+                "--message-format=json",
+            ]),
         "kernel build",
     );
     executables
@@ -298,17 +355,21 @@ fn build_kernel(root: &Path) -> PathBuf {
         .unwrap_or_else(|| fail("cargo did not report a kernel executable"))
 }
 
-fn build_user_programs(root: &Path, extra: &[&str]) -> Vec<PathBuf> {
+fn build_user_programs(root: &Path, arch: &str, extra: &[&str]) -> Vec<PathBuf> {
     let names: Vec<&str> = USER_PROGRAMS
         .iter()
         .copied()
         .chain(extra.iter().copied())
         .collect();
-    println!("==> cargo build --release, user programs");
+    println!("==> cargo build --release, user programs ({arch})");
     let mut command = Command::new("cargo");
-    command
-        .current_dir(root.join("user"))
-        .args(["build", "--release", "--message-format=json"]);
+    command.current_dir(root.join("user")).args([
+        "build",
+        "--release",
+        "--target",
+        target_triple(arch),
+        "--message-format=json",
+    ]);
     for name in &names {
         command.arg("--bin").arg(name);
     }
@@ -390,8 +451,12 @@ fn json_string_field(line: &str, field: &str) -> Option<PathBuf> {
     None
 }
 
-fn require_qemu() -> &'static str {
-    let qemu = "qemu-system-riscv64";
+fn require_qemu(arch: &str) -> &'static str {
+    let qemu = match arch {
+        "riscv64" => "qemu-system-riscv64",
+        "x86_64" => "qemu-system-x86_64",
+        _ => fail("unsupported architecture"),
+    };
     match Command::new(qemu)
         .arg("--version")
         .stdout(Stdio::null())
@@ -399,7 +464,7 @@ fn require_qemu() -> &'static str {
         .status()
     {
         Ok(status) if status.success() => qemu,
-        _ => fail("qemu-system-riscv64 is required"),
+        _ => fail(&format!("{qemu} is required")),
     }
 }
 
@@ -447,28 +512,54 @@ impl Console {
     }
 }
 
-fn spawn_qemu(qemu: &str, kernel: &Path, image: &Path) -> (Child, Console) {
-    let mut child = Command::new(qemu)
-        .args([
-            "-machine",
-            "virt",
-            "-bios",
-            "none",
-            "-m",
-            "128M",
-            "-smp",
-            "3",
-            "-nographic",
-            "-global",
-            "virtio-mmio.force-legacy=false",
-            "-drive",
-        ])
+fn spawn_qemu(qemu: &str, arch: &str, kernel: &Path, image: &Path) -> (Child, Console) {
+    let mut command = Command::new(qemu);
+    match arch {
+        "riscv64" => {
+            command.args([
+                "-machine",
+                "virt",
+                "-bios",
+                "none",
+                "-m",
+                "128M",
+                "-smp",
+                "3",
+                "-nographic",
+                "-global",
+                "virtio-mmio.force-legacy=false",
+            ]);
+        }
+        "x86_64" => {
+            command.args([
+                "-machine",
+                "q35",
+                "-m",
+                "128M",
+                "-smp",
+                "1",
+                "-display",
+                "none",
+                "-serial",
+                "stdio",
+                "-monitor",
+                "none",
+                "-no-reboot",
+            ]);
+        }
+        _ => fail("unsupported architecture"),
+    }
+    let device = if arch == "riscv64" {
+        "virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0"
+    } else {
+        "virtio-blk-pci,disable-legacy=on,drive=x0"
+    };
+    let mut child = command
+        .arg("-drive")
         .arg(format!("file={},if=none,format=raw,id=x0", image.display()))
-        .args([
-            "-device",
-            "virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0",
-            "-kernel",
-        ])
+        .arg("-device")
+        .arg(device)
+        .arg("-kernel")
         .arg(kernel)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -501,8 +592,8 @@ fn spawn_qemu(qemu: &str, kernel: &Path, image: &Path) -> (Child, Console) {
     )
 }
 
-fn boot_echo_test(qemu: &str, kernel: &Path, image: &Path) -> ! {
-    let (mut child, mut console) = spawn_qemu(qemu, kernel, image);
+fn boot_echo_test(qemu: &str, arch: &str, kernel: &Path, image: &Path) -> ! {
+    let (mut child, mut console) = spawn_qemu(qemu, arch, kernel, image);
     console.wait_for(&mut child, b"init: starting sh");
     command(&mut child, &mut console, b"echo hi\n", b"hi\n");
     console.wait_for(&mut child, b"$ ");
@@ -511,8 +602,8 @@ fn boot_echo_test(qemu: &str, kernel: &Path, image: &Path) -> ! {
     std::process::exit(0)
 }
 
-fn boot_shell_smoke(qemu: &str, kernel: &Path, image: &Path, image_files: usize) -> ! {
-    let (mut child, mut console) = spawn_qemu(qemu, kernel, image);
+fn boot_shell_smoke(qemu: &str, arch: &str, kernel: &Path, image: &Path, image_files: usize) -> ! {
+    let (mut child, mut console) = spawn_qemu(qemu, arch, kernel, image);
     console.wait_for(&mut child, b"init: starting sh");
     command(&mut child, &mut console, b"echo hi\n", b"hi\n");
 
@@ -606,8 +697,8 @@ fn fail(message: &str) -> ! {
 fn usage(program: Option<&str>) -> ! {
     let name = program.unwrap_or("cargo xtask");
     eprintln!("usage: {name} check");
-    eprintln!("       {name} run --arch riscv64 [--echo-test]");
-    eprintln!("       {name} test --arch riscv64 [quick|full|crash|log|forphan|dorphan]");
+    eprintln!("       {name} run --arch <riscv64|x86_64> [--echo-test]");
+    eprintln!("       {name} test --arch <riscv64|x86_64> [quick|full|crash|log|forphan|dorphan]");
     std::process::exit(2)
 }
 

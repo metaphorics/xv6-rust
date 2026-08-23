@@ -90,6 +90,27 @@ fn syscall(number: abi::Sys, args: [usize; 6]) -> isize {
     }
     a0 as isize
 }
+
+#[cfg(target_arch = "x86_64")]
+fn syscall(number: abi::Sys, args: [usize; 6]) -> isize {
+    let mut result = number as usize;
+    // SAFETY: `int 0x80` is the x86_64 user ABI boundary installed by the
+    // kernel. Pointer-bearing wrappers keep their storage live for the call.
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") result,
+            in("rdi") args[0],
+            in("rsi") args[1],
+            in("rdx") args[2],
+            in("r10") args[3],
+            in("r8") args[4],
+            in("r9") args[5],
+            options(nostack)
+        );
+    }
+    result as isize
+}
 /// Invoke an xv6 syscall with raw register arguments.
 ///
 /// # Safety

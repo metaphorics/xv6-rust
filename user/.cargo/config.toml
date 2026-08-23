@@ -9,4 +9,8 @@ rustflags = [
 ]
 
 [target.x86_64-unknown-none]
-rustflags = ["-Crelocation-model=static"]
+rustflags = [
+  "-Crelocation-model=static",
+  "-Ccode-model=small",
+  "-Clink-arg=-Tuser/src/user-x86_64.ld",
+]

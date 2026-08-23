@@ -612,8 +612,16 @@ pub fn argptest(_: &[u8]) {
 
 fn stack_pointer() -> usize {
     let sp: usize;
+    #[cfg(target_arch = "riscv64")]
     // SAFETY: reading the current stack pointer has no side effects.
-    unsafe { core::arch::asm!("mv {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
+    unsafe {
+        core::arch::asm!("mv {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags))
+    };
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: reading the current stack pointer has no side effects.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags))
+    };
     sp
 }
 
