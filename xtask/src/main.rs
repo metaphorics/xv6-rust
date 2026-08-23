@@ -177,11 +177,11 @@ fn json_string_field(line: &str, field: &str) -> Option<PathBuf> {
     let start = line.find(&needle)? + needle.len();
     let rest = &line[start..];
     let mut end = None;
-    let mut escapes = 0;
+    let mut escapes: usize = 0;
     for (i, b) in rest.bytes().enumerate() {
         if b == b'\\' {
             escapes += 1;
-        } else if b == b'"' && escapes % 2 == 0 {
+        } else if b == b'"' && escapes.is_multiple_of(2) {
             end = Some(i);
             break;
         } else {
@@ -305,6 +305,45 @@ fn wait_for(child: &mut Child, rx: &mpsc::Receiver<String>, expect: &str, timeou
     }
 }
 
+/// Wait for the characters in `expect` in order. Other serial output may
+/// occur between them: M4's init process writes continuously while the
+/// console interrupt handler echoes input.
+fn wait_for_subsequence(
+    child: &mut Child,
+    rx: &mpsc::Receiver<String>,
+    expect: &str,
+    timeout: Duration,
+) {
+    let mut remaining = expect.chars();
+    let mut next = remaining.next();
+    let deadline = Instant::now() + timeout;
+    while next.is_some() {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(wait) {
+            Ok(line) => {
+                for ch in line.chars() {
+                    if Some(ch) == next {
+                        next = remaining.next();
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                kill(child);
+                eprintln!(
+                    "xtask: timed out after {} s waiting for echo '{expect}'",
+                    timeout.as_secs()
+                );
+                std::process::exit(1);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                kill(child);
+                eprintln!("xtask: qemu output ended before echoing '{expect}'");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 /// Boot `kernel` under QEMU and wait for `expect` to appear on the serial
 /// console. Prints QEMU's output as it arrives; exits 0 on match, 1 on
 /// timeout or early exit.
@@ -317,24 +356,24 @@ fn boot_and_expect(qemu: &str, kernel: &Path, expect: &str) -> ! {
 }
 
 /// Boot `kernel` and exercise the interrupt-driven console end to end:
-/// wait for the interrupts-live banner, send `abc` and expect its echo,
-/// sit out a window of timer ticks, then send `def` and expect that echo
-/// too — proving clock interrupts never wedged the hart serving the UART.
+/// wait until the first user process is running, send `abc` and expect
+/// its echo, sit out a window of timer ticks, then send `def` and expect
+/// that echo too — proving clock interrupts never wedged the UART hart.
 fn boot_and_echo(qemu: &str, kernel: &Path) -> ! {
     let (mut child, rx) = spawn_qemu(qemu, kernel, true);
 
-    // Interrupts are the last thing hart 0 enables before parking.
-    wait_for(&mut child, &rx, "xv6-rust: interrupts live", BOOT_TIMEOUT);
+    // The first user write proves scheduler and device interrupts are live.
+    wait_for(&mut child, &rx, "hello from user", BOOT_TIMEOUT);
 
-    // Let the boot output drain and every hart reach its park.
+    // Let the boot output drain and every hart reach the scheduler.
     thread::sleep(Duration::from_millis(500));
-    send(&mut child, "abc\n");
-    wait_for(&mut child, &rx, "abc", ECHO_TIMEOUT);
+    send(&mut child, "ABC\n");
+    wait_for_subsequence(&mut child, &rx, "ABC", ECHO_TIMEOUT);
 
     // The liveness window: ~15 timer ticks pass before the second echo.
     thread::sleep(Duration::from_millis(1500));
-    send(&mut child, "def\n");
-    wait_for(&mut child, &rx, "def", ECHO_TIMEOUT);
+    send(&mut child, "DEF\n");
+    wait_for_subsequence(&mut child, &rx, "DEF", ECHO_TIMEOUT);
 
     println!("XTASK: echo ok");
     kill(&mut child);
