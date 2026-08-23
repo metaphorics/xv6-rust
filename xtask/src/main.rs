@@ -457,6 +457,13 @@ impl TestHarness {
         );
         send_input(child, b"rm recovery-proof\n");
         finish_command_to_prompt(child, console, b"rm recovery-proof\n", None);
+        send_input(child, b"ls recovery-proof\n");
+        finish_command_to_prompt(
+            child,
+            console,
+            b"ls recovery-proof\n",
+            Some(b"ls: cannot open recovery-proof\n"),
+        );
     }
 }
 
