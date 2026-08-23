@@ -321,11 +321,6 @@ fn display_name(name: &[u8]) -> &str {
     core::str::from_utf8(name).unwrap_or("?")
 }
 
-pub(crate) fn unported(name: &[u8]) -> ! {
-    println!("{}: interim test body", display_name(name));
-    exit(1)
-}
-
 fn run(test: Test) -> bool {
     print!("test {}: ", display_name(test.name));
     let pid = fork();

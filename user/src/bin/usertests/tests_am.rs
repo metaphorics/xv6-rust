@@ -13,7 +13,6 @@ use ustd::{
 
 const BUFSZ: usize = (MAXOPBLOCKS + 2) * BSIZE;
 const NINODE: usize = 50;
-const _: fn(&[u8]) -> ! = crate::unported;
 
 macro_rules! fail {
     ($($arg:tt)*) => {{

@@ -425,6 +425,12 @@ mod tests {
     ];
 
     #[test]
+    fn syscall_surface_is_22_calls_ending_in_sync() {
+        assert_eq!(ALL.len(), 22);
+        assert_eq!(Sys::Sync as u64, 22);
+    }
+
+    #[test]
     fn syscall_numbers_round_trip_in_header_order() {
         for (index, sys) in ALL.iter().enumerate() {
             let num = u64::from(*sys as u16);
