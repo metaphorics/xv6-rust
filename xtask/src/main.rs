@@ -232,6 +232,7 @@ fn test_xv6(arch: &str, test: TestKind) {
     };
     match test {
         TestKind::All => {
+            harness.usertests(TestKind::Quick);
             harness.usertests(TestKind::Full);
             harness.forktest();
             harness.grind();
